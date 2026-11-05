@@ -533,9 +533,9 @@ client.once(Events.ClientReady, async () => {
     status: 'online',
     activities: [
       {
-        name: 'im here trying to help',
+        name: 'Somebody get these nerds out of here',
         type: ActivityType.Custom,
-        state: 'im here trying to help',
+        state: 'Somebody get these nerds out of here',
       },
     ],
   });
