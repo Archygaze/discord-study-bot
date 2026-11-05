@@ -544,7 +544,8 @@ client.once(Events.ClientReady, async () => {
   try {
     await rest.patch(Routes.currentApplication(), {
       body: {
-        description: "someone really sucks at studying and focusing, so i'm here to help hehe",
+        description:
+          'someone really sucks at studying and focusing, so i was built to hold them hostage until they finish hehe',
       },
     });
     console.log('✅ Bot profile "About Me" description updated!');
