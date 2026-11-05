@@ -427,40 +427,20 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
       .join(' ');
 
     if (studyChannel) {
-      await setVoiceChannelStatus(studyChannel.id, '');
-
-      await studyChannel.permissionOverwrites
-        .edit(guild.roles.everyone, {
-          Connect: null,
-        })
-        .catch(() => {});
-
-      for (const userId of session.participants) {
-        await studyChannel.permissionOverwrites.delete(userId).catch(() => {});
-      }
-
-      if (session.messageId) {
-        const oldMsg = await studyChannel.messages.fetch(session.messageId).catch(() => null);
-        if (oldMsg) {
-          await oldMsg.edit({ components: [] }).catch(() => {});
-        }
-      }
+      // Prevent VoiceStateUpdate or sweep from deleting the channel mid-voice-transfer!
+      spawningRooms.add(studyChannel.id);
 
       const resultEmbed = new EmbedBuilder()
         .setColor(endedEarly ? 0xfee75c : 0x57f287)
         .setTitle(endedEarly ? '🔓 Focus Session Ended' : '🎉 Focus Session Complete!')
         .setDescription(
           endedEarly
-            ? `Session ended early${endedByUser ? ` by <@${endedByUser.id}>` : ''}. Moving everyone to **${breakChannel ? breakChannel.name : 'Break Lounge'}**!`
+            ? `Session ended early${endedByUser ? ` by <@${endedByUser.id}>` : ''}. Moved everyone to **${breakChannel ? breakChannel.name : 'Break Lounge'}**!`
             : `Great job ${mentions}! You completed **${session.durationMinutes} minutes** of focused study in **${studyChannel.name}**. Enjoy your break!`
         );
 
       if (breakChannel) {
-        await breakChannel
-          .send({ content: endedEarly ? undefined : mentions, embeds: [resultEmbed] })
-          .catch(() => {});
-
-        // Move everyone currently in the Study Room to the Break Lounge
+        // 1. Move everyone currently in the Study Room to the Break Lounge FIRST
         for (const [, member] of studyChannel.members) {
           if (!member.user.bot) {
             await member.voice
@@ -470,21 +450,33 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
               });
           }
         }
+
+        // 2. Send completion message in Break Lounge
+        await breakChannel
+          .send({ content: endedEarly ? undefined : mentions, embeds: [resultEmbed] })
+          .catch(() => {});
       } else {
         await studyChannel
           .send({ content: endedEarly ? undefined : mentions, embeds: [resultEmbed] })
           .catch(() => {});
       }
 
-      // Delete the finished study room once everyone is moved out
+      // 3. Wait 4 full seconds so Discord finishes transferring the voice connection to Break Lounge before deleting the study room!
       if (isDynamicRoom(studyChannel)) {
         setTimeout(async () => {
+          spawningRooms.delete(studyChannel.id);
           const refreshed = await guild.channels.fetch(studyChannel.id).catch(() => null);
           if (refreshed && refreshed.members.filter((m) => !m.user.bot).size === 0) {
             dynamicStudyRooms.delete(studyChannel.id);
             await refreshed.delete('Study session ended and room is empty').catch(() => {});
           }
-        }, 1500);
+        }, 4000);
+      } else {
+        spawningRooms.delete(studyChannel.id);
+        await setVoiceChannelStatus(studyChannel.id, '');
+        await studyChannel.permissionOverwrites
+          .edit(guild.roles.everyone, { Connect: null })
+          .catch(() => {});
       }
     }
   } catch (err) {
@@ -629,9 +621,19 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
         activeSessions.delete(leftChannel.id);
       }
 
+      // If endFocusSession is already handling the move & delayed deletion, don't delete mid-transfer!
+      if (spawningRooms.has(leftChannel.id)) {
+        return;
+      }
+
       pendingRoomTimers.delete(leftChannel.id);
       dynamicStudyRooms.delete(leftChannel.id);
-      await leftChannel.delete('Study room is now empty').catch(() => {});
+      setTimeout(async () => {
+        const refreshed = await guild.channels.fetch(leftChannel.id).catch(() => null);
+        if (refreshed && refreshed.members.filter((m) => !m.user.bot).size === 0) {
+          await refreshed.delete('Study room is now empty').catch(() => {});
+        }
+      }, 2500);
     }
   }
 
