@@ -1,0 +1,48 @@
+name: 24/7 Discord Study Bot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+  schedule:
+    - cron: '0 */5 * * *'
+
+# Ensure only ONE instance of the bot ever runs at a time
+concurrency:
+  group: discord-study-bot-runner
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Discord Study Bot (5.5h cycle)
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+        run: |
+          # Run for 5 hours 20 minutes (19200s), then exit cleanly so the next step re-triggers the workflow
+          timeout 19200s node index.js || true
+
+      - name: Automatically trigger next 24/7 cycle
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run "24/7 Discord Study Bot" --ref master || true
