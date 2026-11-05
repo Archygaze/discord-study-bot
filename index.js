@@ -544,11 +544,7 @@ client.once(Events.ClientReady, async () => {
   try {
     await rest.patch(Routes.currentApplication(), {
       body: {
-        description:
-          '🎓 Focus & Study Room Bot!\n' +
-          '• Click "➕ New Solo Study" or "➕ New Group Study" to create a room\n' +
-          '• Or type /focus alone & /focus together in any chat\n' +
-          '• Locks your room during focus sessions & moves you to ☕ Break Lounge when finished!',
+        description: 'someone really sucks at studying and focus so im here to help',
       },
     });
     console.log('✅ Bot profile "About Me" description updated!');
