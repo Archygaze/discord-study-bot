@@ -84,23 +84,11 @@ const commands = [
     .addSubcommand((sub) =>
       sub
         .setName('together')
-        .setDescription('Create & move into a Group Study Room together with your friend(s)!')
-        .addUserOption((opt) =>
+        .setDescription('Create & move into a Group Study Room together with your friends!')
+        .addStringOption((opt) =>
           opt
-            .setName('friend')
-            .setDescription('Tag a friend to pull into the Study Room with you!')
-            .setRequired(false)
-        )
-        .addUserOption((opt) =>
-          opt
-            .setName('friend2')
-            .setDescription('Tag another friend to study together (optional)')
-            .setRequired(false)
-        )
-        .addUserOption((opt) =>
-          opt
-            .setName('friend3')
-            .setDescription('Tag a 3rd friend to study together (optional)')
+            .setName('friends')
+            .setDescription('Tag as many friends as you want! (e.g. @friend1 @friend2 @friend3...)')
             .setRequired(false)
         )
         .addIntegerOption((opt) =>
@@ -798,12 +786,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const minutes = interaction.options.getInteger('minutes');
         const breakChannel = findBreakChannel(guild);
 
-        // Collect any tagged friends for /study together
-        const taggedUsers = [
-          interaction.options.getUser('friend'),
-          interaction.options.getUser('friend2'),
-          interaction.options.getUser('friend3'),
-        ].filter((u) => u && !u.bot && u.id !== member.id);
+        // Collect any number of @mentioned friends from the 'friends' string option!
+        const friendsRaw = interaction.options.getString('friends') || '';
+        const mentionedIds = Array.from(friendsRaw.matchAll(/<@!?(\d+)>/g), (m) => m[1]);
+        const uniqueFriendIds = [...new Set(mentionedIds)].filter((id) => id !== member.id);
 
         await interaction.deferReply();
 
@@ -837,17 +823,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
         // If /study together had tagged friend(s), move any tagged friends who are in voice into targetRoom too!
         const movedFriends = [];
         const offlineVoiceFriends = [];
-        for (const friendUser of taggedUsers) {
-          const friendMember = await guild.members.fetch(friendUser.id).catch(() => null);
-          if (friendMember && friendMember.voice.channelId) {
-            if (friendMember.voice.channelId !== targetRoom.id) {
-              await friendMember.voice
-                .setChannel(targetRoom, `Moved with ${member.user.username} via /study together`)
-                .catch(() => {});
+        for (const friendId of uniqueFriendIds) {
+          const friendMember = await guild.members.fetch(friendId).catch(() => null);
+          if (friendMember && !friendMember.user.bot) {
+            if (friendMember.voice.channelId) {
+              if (friendMember.voice.channelId !== targetRoom.id) {
+                await friendMember.voice
+                  .setChannel(targetRoom, `Moved with ${member.user.username} via /study together`)
+                  .catch(() => {});
+              }
+              movedFriends.push(`<@${friendId}>`);
+            } else {
+              offlineVoiceFriends.push(`<@${friendId}>`);
             }
-            movedFriends.push(`<@${friendUser.id}>`);
-          } else if (friendMember) {
-            offlineVoiceFriends.push(`<@${friendUser.id}>`);
           }
         }
 
