@@ -2,6 +2,7 @@ require('dotenv').config();
 const {
   Client,
   Events,
+  ActivityType,
   GatewayIntentBits,
   ChannelType,
   PermissionFlagsBits,
@@ -526,6 +527,34 @@ async function cleanupEmptyStudyRooms() {
 
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+
+  // 1. Set the Bot's live status in the member list
+  client.user.setPresence({
+    status: 'online',
+    activities: [
+      {
+        name: '📚 /focus alone • Lock in & Study!',
+        type: ActivityType.Custom,
+        state: '📚 /focus alone • Lock in & Study!',
+      },
+    ],
+  });
+
+  // 2. Set the Bot's Profile "About Me" description automatically via Discord API
+  try {
+    await rest.patch(Routes.currentApplication(), {
+      body: {
+        description:
+          '🎓 Focus & Study Room Bot!\n' +
+          '• Click "➕ New Solo Study" or "➕ New Group Study" to create a room\n' +
+          '• Or type /focus alone & /focus together in any chat\n' +
+          '• Locks your room during focus sessions & moves you to ☕ Break Lounge when finished!',
+      },
+    });
+    console.log('✅ Bot profile "About Me" description updated!');
+  } catch (err) {
+    console.error('Could not update application description:', err.message);
+  }
 
   try {
     await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
