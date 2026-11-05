@@ -38,9 +38,17 @@ const activeSessions = new Map();
 // Map<userId, studyChannelId>
 const lockedUsers = new Map();
 
+// Track paused sessions when a user logs off / disconnects before their timer finishes
+// Map<userId, { remainingMs: number, originalMinutes: number }>
+const pausedSessions = new Map();
+
 // Track dynamically spawned study rooms so they auto-delete when empty
 // Set<channelId>
 const dynamicStudyRooms = new Set();
+
+// Track rooms currently being spawned so a 1-second delay before user move doesn't delete them
+// Set<channelId>
+const spawningRooms = new Set();
 
 // Channel names
 const CREATE_SOLO_NAME = '➕ New Solo Study';
@@ -75,25 +83,37 @@ function isGeneratorChannel(channel) {
   return name.includes('➕') || name.includes('new solo') || name.includes('new group');
 }
 
-// Helper: Check if a channel is an active/spawned Study Room (not a generator)
-function isStudyChannel(channel) {
+// Helper: Check if a channel is the Break Lounge
+function isBreakChannel(channel) {
   if (!channel || channel.type !== ChannelType.GuildVoice) return false;
-  if (isGeneratorChannel(channel)) return false;
-  if (dynamicStudyRooms.has(channel.id)) return true;
   const name = channel.name.toLowerCase();
-  return name.includes('study') || name.includes('🎧') || name.includes('👥') || name.includes('📖');
+  return (
+    channel.id === process.env.BREAK_CHANNEL_ID ||
+    name.includes('break') ||
+    name.includes('lounge') ||
+    channel.name === BREAK_CHANNEL_NAME
+  );
 }
 
-// Helper: Check if a dynamic room should auto-delete when empty
+// Helper: Check if a channel is a dynamic Study Room that should auto-delete when empty
 function isDynamicRoom(channel) {
   if (!channel || channel.type !== ChannelType.GuildVoice) return false;
-  if (isGeneratorChannel(channel)) return false;
+  if (isGeneratorChannel(channel) || isBreakChannel(channel)) return false;
   if (dynamicStudyRooms.has(channel.id)) return true;
+  const name = channel.name.toLowerCase();
   return (
-    channel.name.includes('Study Room #') ||
-    channel.name.includes('Study Together #') ||
-    channel.name.includes("'s Study")
+    name.includes('study room') ||
+    name.includes('study together') ||
+    name.includes("'s study") ||
+    name.includes('🎧') ||
+    name.includes('📖') ||
+    name.includes('👥')
   );
+}
+
+// Helper: Check if a channel is an active/spawned Study Room (not a generator)
+function isStudyChannel(channel) {
+  return isDynamicRoom(channel);
 }
 
 // Helper: Get next available room number (e.g. 📖 Study Room #1, #2, #3...)
@@ -112,14 +132,7 @@ function getNextRoomName(guild, isSolo) {
 
 // Helper: Find Break Lounge in a guild
 function findBreakChannel(guild) {
-  return guild.channels.cache.find(
-    (ch) =>
-      ch.type === ChannelType.GuildVoice &&
-      (ch.id === process.env.BREAK_CHANNEL_ID ||
-        ch.name.toLowerCase().includes('break') ||
-        ch.name.toLowerCase().includes('lounge') ||
-        ch.name === BREAK_CHANNEL_NAME)
-  );
+  return guild.channels.cache.find((ch) => isBreakChannel(ch));
 }
 
 // Helper: Set Discord Voice Channel Status ("Set a channel status")
@@ -155,7 +168,8 @@ function buildPromptPayload(studyChannel, isSolo) {
         `• 🔒 **Room Locks:** Nobody else can enter while the timer runs.\n` +
         `• 💬 **Live Status:** Sets the channel status to \`[Username] is studying • Xm left\`.\n` +
         `• 🚫 **No Channel Hopping:** Switching channels pulls you right back here.\n` +
-        `• ☕ **Auto-Break:** Moves everyone to **${BREAK_CHANNEL_NAME}** & cleans up the room when done!`
+        `• 💾 **Auto-Save on Disconnect:** If you log off early, your room deletes and your remaining time automatically resumes next time you create a room!\n` +
+        `• ☕ **Auto-Break:** Moves everyone to **${BREAK_CHANNEL_NAME}** & deletes the room when done!`
     )
     .setFooter({ text: 'Choose a focus duration below to lock in' });
 
@@ -180,8 +194,16 @@ function buildPromptPayload(studyChannel, isSolo) {
   return { embeds: [embed], components: [row] };
 }
 
-// Start a locked study session in a specific studyChannel
-async function startFocusSession(guild, studyChannel, breakChannel, durationMinutes, starterUser) {
+// Start or resume a locked study session in a specific studyChannel
+async function startFocusSession(
+  guild,
+  studyChannel,
+  breakChannel,
+  durationMs,
+  starterUser,
+  isResumed = false,
+  originalMinutes = null
+) {
   if (activeSessions.has(studyChannel.id)) {
     return { ok: false, error: 'A focus session is already running in this room!' };
   }
@@ -193,6 +215,8 @@ async function startFocusSession(guild, studyChannel, breakChannel, durationMinu
 
   const participantIds = new Set(membersInRoom.map((m) => m.id));
   const participantNames = membersInRoom.map((m) => m.displayName || m.user.username);
+  const displayMinutes = Math.max(1, Math.ceil(durationMs / 60000));
+  const totalMinutes = originalMinutes || displayMinutes;
 
   try {
     // 1. Ensure the bot itself keeps Connect/View/Send/Manage permissions before locking @everyone
@@ -214,6 +238,7 @@ async function startFocusSession(guild, studyChannel, breakChannel, durationMinu
         })
         .catch(() => {});
       lockedUsers.set(userId, studyChannel.id);
+      pausedSessions.delete(userId);
     }
 
     // 3. Lock the channel for @everyone so outsiders cannot connect
@@ -232,13 +257,13 @@ async function startFocusSession(guild, studyChannel, breakChannel, durationMinu
     };
   }
 
-  const endTimeMs = Date.now() + durationMinutes * 60 * 1000;
+  const endTimeMs = Date.now() + durationMs;
   const endTimestampSec = Math.floor(endTimeMs / 1000);
 
-  // 4. Set the Voice Channel Status immediately ("🔒 username is studying • 20m left")
+  // 4. Set the Voice Channel Status immediately ("🔒 username is studying • Xm left")
   await setVoiceChannelStatus(
     studyChannel.id,
-    formatStudyStatus(participantNames, durationMinutes)
+    formatStudyStatus(participantNames, displayMinutes)
   );
 
   // Update the Voice Channel Status every minute as the timer counts down
@@ -250,16 +275,22 @@ async function startFocusSession(guild, studyChannel, breakChannel, durationMinu
   }, 60 * 1000);
 
   const embed = new EmbedBuilder()
-    .setColor(0xed4245)
-    .setTitle(`🔒 Focus Session Locked (${durationMinutes} mins)`)
+    .setColor(isResumed ? 0xfee75c : 0xed4245)
+    .setTitle(
+      isResumed
+        ? `🔄 Resumed Focus Session (${displayMinutes} mins left)`
+        : `🔒 Focus Session Locked (${displayMinutes} mins)`
+    )
     .setDescription(
-      `Started by <@${starterUser.id}> in **${studyChannel.name}**\n\n` +
-        `💬 **Channel Status:** \`${formatStudyStatus(participantNames, durationMinutes)}\`\n` +
+      (isResumed
+        ? `Welcome back <@${starterUser.id}>! Continuing your previous **${totalMinutes}-minute** session in **${studyChannel.name}**.\n\n`
+        : `Started by <@${starterUser.id}> in **${studyChannel.name}**\n\n`) +
+        `💬 **Channel Status:** \`${formatStudyStatus(participantNames, displayMinutes)}\`\n` +
         `⏳ **Ends:** <t:${endTimestampSec}:R> (at <t:${endTimestampSec}:t>)\n` +
         `👥 **Locked-in:** ${Array.from(participantIds)
           .map((id) => `<@${id}>`)
           .join(', ')}\n\n` +
-        `*This room is now locked to outsiders. Stay focused!*`
+        `*This room is locked to outsiders. If you log off early, your remaining time will be saved!*`
     );
 
   const row = new ActionRowBuilder().addComponents(
@@ -274,7 +305,7 @@ async function startFocusSession(guild, studyChannel, breakChannel, durationMinu
 
   const timeoutId = setTimeout(() => {
     endFocusSession(studyChannel.id, false);
-  }, durationMinutes * 60 * 1000);
+  }, durationMs);
 
   activeSessions.set(studyChannel.id, {
     guildId: guild.id,
@@ -286,13 +317,13 @@ async function startFocusSession(guild, studyChannel, breakChannel, durationMinu
     timeoutId,
     intervalId,
     messageId: msg.id,
-    durationMinutes,
+    durationMinutes: totalMinutes,
   });
 
   return { ok: true };
 }
 
-// End a study session, move members to the single Break Lounge, and clean up dynamic room if empty
+// End a study session, move members to the single Break Lounge, and delete dynamic room
 async function endFocusSession(studyChannelId, endedEarly = false, endedByUser = null) {
   const session = activeSessions.get(studyChannelId);
   if (!session) return;
@@ -303,6 +334,7 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
 
   for (const userId of session.participants) {
     lockedUsers.delete(userId);
+    pausedSessions.delete(userId);
   }
 
   try {
@@ -318,10 +350,8 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
       .join(' ');
 
     if (studyChannel) {
-      // 1. Clear the Voice Channel Status
       await setVoiceChannelStatus(studyChannel.id, '');
 
-      // 2. Unlock @everyone Connect permission
       await studyChannel.permissionOverwrites
         .edit(guild.roles.everyone, {
           Connect: null,
@@ -348,7 +378,7 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
           );
         await studyChannel.send({ embeds: [earlyEmbed] }).catch(() => {});
       } else {
-        // Timer completed naturally -> Move everyone to Break Lounge & notify in Break Lounge
+        // Timer completed naturally -> Move everyone to Break Lounge & delete the study room
         const doneEmbed = new EmbedBuilder()
           .setColor(0x57f287)
           .setTitle('🎉 Focus Session Complete!')
@@ -374,7 +404,7 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
             .catch(() => {});
         }
 
-        // Delete the temporary study room if it is a dynamic room and now empty
+        // Delete the finished study room once everyone is moved out
         if (isDynamicRoom(studyChannel)) {
           setTimeout(async () => {
             const refreshed = await guild.channels.fetch(studyChannel.id).catch(() => null);
@@ -391,6 +421,40 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
   }
 }
 
+// Helper: Sweep and delete any empty dynamic study rooms in all guilds
+async function cleanupEmptyStudyRooms() {
+  for (const [, guild] of client.guilds.cache) {
+    await guild.channels.fetch().catch(() => {});
+    for (const [, ch] of guild.channels.cache) {
+      if (isDynamicRoom(ch) && !spawningRooms.has(ch.id)) {
+        const humans = ch.members.filter((m) => !m.user.bot).size;
+        if (humans === 0) {
+          if (activeSessions.has(ch.id)) {
+            const session = activeSessions.get(ch.id);
+            const remainingMs = session.endTime - Date.now();
+            if (remainingMs > 15000) {
+              for (const userId of session.participants) {
+                pausedSessions.set(userId, {
+                  remainingMs,
+                  originalMinutes: session.durationMinutes,
+                });
+                lockedUsers.delete(userId);
+              }
+            }
+            clearTimeout(session.timeoutId);
+            clearInterval(session.intervalId);
+            activeSessions.delete(ch.id);
+          }
+          dynamicStudyRooms.delete(ch.id);
+          await ch.delete('Cleaning up empty dynamic study room').catch((err) => {
+            console.error(`Failed to delete empty room ${ch.name}:`, err.message);
+          });
+        }
+      }
+    }
+  }
+}
+
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
@@ -401,37 +465,27 @@ client.once(Events.ClientReady, async () => {
     console.error('Failed to register slash commands:', err);
   }
 
-  // Clean up or rename any leftover "'s Study" channels from earlier
-  for (const [, guild] of client.guilds.cache) {
-    for (const [, ch] of guild.channels.cache) {
-      if (ch.type === ChannelType.GuildVoice && ch.name.includes("'s Study")) {
-        const humans = ch.members.filter((m) => !m.user.bot).size;
-        if (humans === 0) {
-          await ch.delete('Cleaning up empty dynamic study room').catch(() => {});
-        } else {
-          const isSolo = ch.userLimit === 1;
-          const newName = getNextRoomName(guild, isSolo);
-          dynamicStudyRooms.add(ch.id);
-          await ch.setName(newName).catch(() => {});
-        }
-      }
-    }
-  }
+  // Immediately delete any leftover empty study rooms on startup
+  await cleanupEmptyStudyRooms();
+
+  // Safety sweep every 15 seconds so empty study rooms never linger
+  setInterval(cleanupEmptyStudyRooms, 15000);
 });
 
-// Handle Voice State Updates (Join-to-Create, Locked-in Hop Prevention, Empty Room Cleanup)
+// Handle Voice State Updates (Join-to-Create, Auto-Resume, Hop Prevention, Empty Room Deletion)
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   const member = newState.member || oldState.member;
   if (!member || member.user.bot) return;
 
   const guild = newState.guild || oldState.guild;
 
-  // 1. User is locked into an active session and tries to switch to ANY other voice channel
+  // 1. User is locked into an active session and tries to switch to a DIFFERENT voice channel (not disconnecting)
   const lockedStudyChannelId = lockedUsers.get(member.id);
   if (
     lockedStudyChannelId &&
     newState.channelId &&
-    newState.channelId !== lockedStudyChannelId
+    newState.channelId !== lockedStudyChannelId &&
+    !isGeneratorChannel(newState.channel)
   ) {
     const targetStudyChannel = guild.channels.cache.get(lockedStudyChannelId);
     if (targetStudyChannel && activeSessions.has(lockedStudyChannelId)) {
@@ -447,7 +501,46 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     }
   }
 
-  // 2. User joins "➕ New Solo Study" or "➕ New Group Study" -> Spawn "📖 Study Room #1" or "👥 Study Together #1"
+  // 2. Check if the channel the user just left is now empty -> Pause session (if active) & delete the room!
+  const leftChannel = oldState.channel;
+  if (leftChannel && isDynamicRoom(leftChannel) && leftChannel.id !== newState.channelId) {
+    const remainingHumans = leftChannel.members.filter((m) => !m.user.bot).size;
+    if (remainingHumans === 0) {
+      if (activeSessions.has(leftChannel.id)) {
+        const session = activeSessions.get(leftChannel.id);
+        const remainingMs = session.endTime - Date.now();
+        // Save remaining time so when they create a new room later, it continues where they left off!
+        if (remainingMs > 15000) {
+          for (const userId of session.participants) {
+            pausedSessions.set(userId, {
+              remainingMs,
+              originalMinutes: session.durationMinutes,
+            });
+            lockedUsers.delete(userId);
+          }
+          console.log(
+            `💾 Saved paused session (${Math.ceil(remainingMs / 60000)}m left) for user(s): ${Array.from(
+              session.participants
+            ).join(', ')}`
+          );
+        } else {
+          for (const userId of session.participants) {
+            lockedUsers.delete(userId);
+          }
+        }
+        clearTimeout(session.timeoutId);
+        clearInterval(session.intervalId);
+        activeSessions.delete(leftChannel.id);
+      }
+
+      dynamicStudyRooms.delete(leftChannel.id);
+      await leftChannel.delete('Study room is now empty').catch((err) => {
+        console.error(`Could not delete empty study room ${leftChannel.name}:`, err.message);
+      });
+    }
+  }
+
+  // 3. User joins "➕ New Solo Study" or "➕ New Group Study" -> Spawn room & auto-continue if they had a paused timer!
   const joinedChannel = newState.channel;
   if (joinedChannel && isGeneratorChannel(joinedChannel)) {
     const isSolo = joinedChannel.name.toLowerCase().includes('solo');
@@ -474,34 +567,31 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
       });
 
       dynamicStudyRooms.add(spawnedRoom.id);
+      spawningRooms.add(spawnedRoom.id);
+      setTimeout(() => spawningRooms.delete(spawnedRoom.id), 10000);
 
       // Move the user into their newly spawned study room
       await member.voice.setChannel(spawnedRoom, 'Spawned study room');
 
-      // Send the timer buttons inside the new study room's voice chat
-      await spawnedRoom.send(buildPromptPayload(spawnedRoom, isSolo)).catch(() => {});
+      // Check if this user has an unfinished session from earlier to continue automatically!
+      const paused = pausedSessions.get(member.id);
+      if (paused && paused.remainingMs > 15000) {
+        const breakChannel = findBreakChannel(guild);
+        await startFocusSession(
+          guild,
+          spawnedRoom,
+          breakChannel,
+          paused.remainingMs,
+          member.user,
+          true,
+          paused.originalMinutes
+        );
+      } else {
+        // Otherwise send the fresh timer buttons
+        await spawnedRoom.send(buildPromptPayload(spawnedRoom, isSolo)).catch(() => {});
+      }
     } catch (err) {
       console.error('Failed to spawn dynamic study room:', err.message);
-    }
-    return;
-  }
-
-  // 3. Clean up empty dynamic study rooms when everyone leaves
-  const leftChannel = oldState.channel;
-  if (leftChannel && isDynamicRoom(leftChannel) && leftChannel.id !== newState.channelId) {
-    const remainingHumans = leftChannel.members.filter((m) => !m.user.bot).size;
-    if (remainingHumans === 0) {
-      if (activeSessions.has(leftChannel.id)) {
-        const session = activeSessions.get(leftChannel.id);
-        clearTimeout(session.timeoutId);
-        clearInterval(session.intervalId);
-        for (const userId of session.participants) {
-          lockedUsers.delete(userId);
-        }
-        activeSessions.delete(leftChannel.id);
-      }
-      dynamicStudyRooms.delete(leftChannel.id);
-      await leftChannel.delete('Dynamic study room is empty').catch(() => {});
     }
   }
 });
@@ -580,8 +670,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           guild,
           currentVoice,
           breakChannel,
-          minutes,
-          interaction.user
+          minutes * 60 * 1000,
+          interaction.user,
+          false,
+          minutes
         );
         if (!res.ok) {
           return interaction.editReply(`❌ ${res.error}`);
@@ -634,8 +726,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           guild,
           studyChannel,
           breakChannel,
-          minutes,
-          interaction.user
+          minutes * 60 * 1000,
+          interaction.user,
+          false,
+          minutes
         );
         if (!res.ok) {
           await interaction.followUp({
