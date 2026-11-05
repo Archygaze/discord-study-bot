@@ -657,7 +657,7 @@ client.once(Events.ClientReady, async () => {
     await rest.patch(Routes.currentApplication(), {
       body: {
         description:
-          'someone really sucks at studying and focusing, so i was built to hold them hostage until they finish hehe\n\n' +
+          'get in the study room. nobody leaves until the timer hits zero.\n\n' +
           'created by Archygaze',
       },
     });
