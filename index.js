@@ -860,10 +860,18 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
         joinedChannel.id,
         `⏳ Waiting for friends (${readiness.presentCount}/${readiness.totalExpected} joined)...`
       );
+      const startNowRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`focus_startnow_${joinedChannel.id}`)
+          .setLabel('Start Study Session Now')
+          .setEmoji('▶️')
+          .setStyle(ButtonStyle.Success)
+      );
       await joinedChannel
-        .send(
-          `👋 <@${member.id}> joined! Waiting for **${readiness.requiredCount - readiness.presentCount}** more invited friend(s) before the **${pending.originalMinutes}-minute** timer starts...`
-        )
+        .send({
+          content: `👋 <@${member.id}> joined! Waiting for **${readiness.requiredCount - readiness.presentCount}** more invited friend(s) before the **${pending.originalMinutes}-minute** timer starts (or click below to start now):`,
+          components: [startNowRow],
+        })
         .catch(() => {});
     }
     return;
@@ -1112,20 +1120,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
             );
             const joinRow = new ActionRowBuilder().addComponents(
               new ButtonBuilder()
+                .setCustomId(`focus_startnow_${targetRoom.id}`)
+                .setLabel('Start Study Session Now')
+                .setEmoji('▶️')
+                .setStyle(ButtonStyle.Success),
+              new ButtonBuilder()
                 .setLabel(`Join ${targetRoom.name} (${minutes}m Timer Waiting)`)
                 .setEmoji('🔊')
                 .setStyle(ButtonStyle.Link)
                 .setURL(`https://discord.com/channels/${guild.id}/${targetRoom.id}`)
             );
             await targetRoom
-              .send(
-                `⏳ **Waiting for invited friend(s) to join before starting the ${minutes}-minute timer!** (${readiness.presentCount}/${readiness.totalExpected} in voice — needs at least ${readiness.requiredCount})`
-              )
+              .send({
+                content: `⏳ **Waiting for invited friend(s) to join before starting the ${minutes}-minute timer!** (${readiness.presentCount}/${readiness.totalExpected} in voice — needs at least ${readiness.requiredCount}, or click **Start Study Session Now** below)`,
+                components: [joinRow],
+              })
               .catch(() => {});
             return interaction.editReply({
               content:
                 `⏳ Moved to **${targetRoom.name}** (<#${targetRoom.id}>)!${friendSummary}\n` +
-                `⏱️ Your **${minutes}-minute** timer is queued and will **start automatically** once your invited friend(s) join (${readiness.presentCount}/${readiness.totalExpected} here):`,
+                `⏱️ Your **${minutes}-minute** timer is queued and will **start automatically** once your invited friend(s) join (${readiness.presentCount}/${readiness.totalExpected} here) — or click **Start Study Session Now**:`,
               components: [joinRow],
             });
           }
@@ -1175,6 +1189,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
             );
             const joinRow = new ActionRowBuilder().addComponents(
               new ButtonBuilder()
+                .setCustomId(`focus_startnow_${targetRoom.id}`)
+                .setLabel('Start Study Session Now')
+                .setEmoji('▶️')
+                .setStyle(ButtonStyle.Success),
+              new ButtonBuilder()
                 .setLabel(`Join ${targetRoom.name} (Resume ${minsLeft}m)`)
                 .setEmoji('🔊')
                 .setStyle(ButtonStyle.Link)
@@ -1183,7 +1202,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             return interaction.editReply({
               content:
                 `⏳ Moved to **${targetRoom.name}** (<#${targetRoom.id}>)!${friendSummary}\n` +
-                `🔄 Your paused session (**${minsLeft} mins** left) will **resume automatically** once your invited friend(s) join (${readiness.presentCount}/${readiness.totalExpected} here):`,
+                `🔄 Your paused session (**${minsLeft} mins** left) will **resume automatically** once your invited friend(s) join (${readiness.presentCount}/${readiness.totalExpected} here) — or click **Start Study Session Now**:`,
               components: [joinRow],
             });
           }
@@ -1239,8 +1258,73 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const member = await guild.members.fetch(interaction.user.id).catch(() => interaction.member);
       const breakChannel = findBreakChannel(guild);
 
+      // Start Study Session Now Button: focus_startnow_<channelId>
+      if (customId.startsWith('focus_startnow_')) {
+        const targetChannelId = customId.split('_')[2] || (member.voice && member.voice.channelId);
+        const studyChannel = guild.channels.cache.get(targetChannelId);
+
+        if (!studyChannel) {
+          return interaction.reply({
+            content: '❌ That Study Room no longer exists.',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+
+        if (activeSessions.has(studyChannel.id)) {
+          return interaction.reply({
+            content: 'ℹ️ The focus session is already running in this room!',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+
+        if (member.voice.channelId && member.voice.channelId !== studyChannel.id) {
+          await member.voice.setChannel(studyChannel, 'Starting focus session now').catch(() => {});
+        }
+
+        const pending = pendingRoomTimers.get(studyChannel.id);
+        pendingRoomTimers.delete(studyChannel.id);
+
+        const invitedSet = roomInvitedFriends.get(studyChannel.id);
+        const invitedFriendIds =
+          pending && pending.invitedFriendIds
+            ? pending.invitedFriendIds
+            : invitedSet
+              ? Array.from(invitedSet)
+              : [];
+
+        const durationMs = pending ? pending.durationMs : 20 * 60 * 1000;
+        const originalMinutes = pending ? pending.originalMinutes : 20;
+        const isResumed = pending ? pending.isResumed : false;
+
+        await interaction.deferUpdate();
+        const refreshedStudyChannel = await guild.channels
+          .fetch(studyChannel.id)
+          .catch(() => studyChannel);
+        const res = await startFocusSession(
+          guild,
+          refreshedStudyChannel,
+          breakChannel,
+          durationMs,
+          interaction.user,
+          isResumed,
+          originalMinutes,
+          invitedFriendIds
+        );
+        if (!res.ok) {
+          await interaction.followUp({
+            content: `❌ ${res.error}`,
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+        return;
+      }
+
       // Start Focus Button: focus_<minutes>_<channelId>
-      if (customId.startsWith('focus_') && !customId.startsWith('focus_unlock')) {
+      if (
+        customId.startsWith('focus_') &&
+        !customId.startsWith('focus_unlock') &&
+        !customId.startsWith('focus_startnow_')
+      ) {
         const parts = customId.split('_');
         const minutes = parseInt(parts[1], 10);
         const targetChannelId = parts[2] || (member.voice && member.voice.channelId);
@@ -1300,8 +1384,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
             studyChannel.id,
             `⏳ Waiting for friends (${readiness.presentCount}/${readiness.totalExpected} joined)...`
           );
+          const startNowRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`focus_startnow_${studyChannel.id}`)
+              .setLabel('Start Study Session Now')
+              .setEmoji('▶️')
+              .setStyle(ButtonStyle.Success)
+          );
           return interaction.reply({
-            content: `⏳ **${minutes}-minute** timer is queued! Waiting for your invited friend(s) to join <#${studyChannel.id}> (${readiness.presentCount}/${readiness.totalExpected} in voice — needs at least ${readiness.requiredCount}) before the countdown starts!`,
+            content: `⏳ **${minutes}-minute** timer is queued! Waiting for your invited friend(s) to join <#${studyChannel.id}> (${readiness.presentCount}/${readiness.totalExpected} in voice — needs at least ${readiness.requiredCount}) before the countdown starts, or click below to start now:`,
+            components: [startNowRow],
           });
         }
 
