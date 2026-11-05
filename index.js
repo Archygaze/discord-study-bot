@@ -176,18 +176,6 @@ async function spawnStudyRoom(guild, isSolo, parentCategoryId = null, graceMs = 
     type: ChannelType.GuildVoice,
     parent: category,
     userLimit: isSolo ? 1 : 0,
-    permissionOverwrites: [
-      {
-        id: client.user.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.Connect,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ManageChannels,
-          PermissionFlagsBits.MoveMembers,
-        ],
-      },
-    ],
   });
 
   dynamicStudyRooms.add(spawnedRoom.id);
@@ -295,43 +283,29 @@ async function startFocusSession(
   const displayMinutes = Math.max(1, Math.ceil(durationMs / 60000));
   const totalMinutes = originalMinutes || displayMinutes;
 
+  for (const userId of participantIds) {
+    lockedUsers.set(userId, studyChannel.id);
+    pausedSessions.delete(userId);
+  }
+
+  // Lock Method A: Set userLimit to exact participant count (only requires Manage Channels!)
+  await studyChannel.setUserLimit(Math.max(1, participantIds.size)).catch(() => {});
+
+  // Lock Method B: Also apply permission overwrites if the bot has Manage Roles in this server
   try {
-    // 1. Ensure the bot itself keeps Connect/View/Send/Manage permissions before locking @everyone
-    await studyChannel.permissionOverwrites
-      .edit(client.user.id, {
-        ViewChannel: true,
-        Connect: true,
-        SendMessages: true,
-        ManageChannels: true,
-        MoveMembers: true,
-      })
-      .catch(() => {});
-
-    // 2. Grant Connect to locked-in participants BEFORE denying @everyone
-    for (const userId of participantIds) {
-      await studyChannel.permissionOverwrites
-        .edit(userId, {
-          Connect: true,
-        })
-        .catch(() => {});
-      lockedUsers.set(userId, studyChannel.id);
-      pausedSessions.delete(userId);
-    }
-
-    // 3. Lock the channel for @everyone so outsiders cannot connect
-    await studyChannel.permissionOverwrites.edit(guild.roles.everyone, {
-      Connect: false,
+    await studyChannel.permissionOverwrites.edit(client.user.id, {
+      ViewChannel: true,
+      Connect: true,
+      SendMessages: true,
+      ManageChannels: true,
+      MoveMembers: true,
     });
-  } catch (err) {
-    console.error('Permission error while locking Study Room:', err.message);
     for (const userId of participantIds) {
-      lockedUsers.delete(userId);
+      await studyChannel.permissionOverwrites.edit(userId, { Connect: true });
     }
-    return {
-      ok: false,
-      error:
-        'Missing Discord permissions to lock the channel! Make sure the bot role has **Administrator** in Server Settings → Roles.',
-    };
+    await studyChannel.permissionOverwrites.edit(guild.roles.everyone, { Connect: false });
+  } catch {
+    // Even without Manage Roles, Method A (userLimit) + Method C (auto-bouncing outsiders) locks the room!
   }
 
   const endTimeMs = Date.now() + durationMs;
@@ -649,8 +623,24 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     }
   }
 
-  // 3. User joins a Study Room that has a pending timer from `/focus alone` (when they weren't in voice yet)
+  // 3. User joins a Study Room that has an active locked session -> If they aren't a locked-in participant, bounce them out!
   const joinedChannel = newState.channel;
+  if (
+    joinedChannel &&
+    activeSessions.has(joinedChannel.id) &&
+    oldState.channelId !== joinedChannel.id
+  ) {
+    const session = activeSessions.get(joinedChannel.id);
+    if (!session.participants.has(member.id)) {
+      const breakChannel = findBreakChannel(guild);
+      await member.voice
+        .setChannel(breakChannel || null, 'Study room is locked in an active focus session')
+        .catch(() => {});
+      return;
+    }
+  }
+
+  // 4. User joins a Study Room that has a pending timer from `/focus alone` (when they weren't in voice yet)
   if (joinedChannel && pendingRoomTimers.has(joinedChannel.id)) {
     const pending = pendingRoomTimers.get(joinedChannel.id);
     pendingRoomTimers.delete(joinedChannel.id);
