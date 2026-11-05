@@ -369,51 +369,45 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
         }
       }
 
-      if (endedEarly) {
-        const earlyEmbed = new EmbedBuilder()
-          .setColor(0xfee75c)
-          .setTitle('🔓 Focus Session Ended Early')
-          .setDescription(
-            `Session unlocked early${endedByUser ? ` by <@${endedByUser.id}>` : ''}. **${studyChannel.name}** is now unlocked!`
-          );
-        await studyChannel.send({ embeds: [earlyEmbed] }).catch(() => {});
-      } else {
-        // Timer completed naturally -> Move everyone to Break Lounge & delete the study room
-        const doneEmbed = new EmbedBuilder()
-          .setColor(0x57f287)
-          .setTitle('🎉 Focus Session Complete!')
-          .setDescription(
-            `Great job ${mentions}! You completed **${session.durationMinutes} minutes** of focused study in **${studyChannel.name}**. Enjoy your break!`
-          );
+      const resultEmbed = new EmbedBuilder()
+        .setColor(endedEarly ? 0xfee75c : 0x57f287)
+        .setTitle(endedEarly ? '🔓 Focus Session Ended' : '🎉 Focus Session Complete!')
+        .setDescription(
+          endedEarly
+            ? `Session ended early${endedByUser ? ` by <@${endedByUser.id}>` : ''}. Moving everyone to **${breakChannel ? breakChannel.name : 'Break Lounge'}**!`
+            : `Great job ${mentions}! You completed **${session.durationMinutes} minutes** of focused study in **${studyChannel.name}**. Enjoy your break!`
+        );
 
-        if (breakChannel) {
-          await breakChannel
-            .send({ content: mentions, embeds: [doneEmbed] })
-            .catch(() => {});
+      if (breakChannel) {
+        await breakChannel
+          .send({ content: endedEarly ? undefined : mentions, embeds: [resultEmbed] })
+          .catch(() => {});
 
-          for (const [, member] of studyChannel.members) {
-            if (!member.user.bot) {
-              await member.voice
-                .setChannel(breakChannel, 'Focus session completed')
-                .catch(() => {});
-            }
+        // Move everyone currently in the Study Room to the Break Lounge
+        for (const [, member] of studyChannel.members) {
+          if (!member.user.bot) {
+            await member.voice
+              .setChannel(breakChannel, 'Focus session ended - moving to Break Lounge')
+              .catch((err) => {
+                console.error(`Failed to move ${member.user.tag} to Break Lounge:`, err.message);
+              });
           }
-        } else {
-          await studyChannel
-            .send({ content: mentions, embeds: [doneEmbed] })
-            .catch(() => {});
         }
+      } else {
+        await studyChannel
+          .send({ content: endedEarly ? undefined : mentions, embeds: [resultEmbed] })
+          .catch(() => {});
+      }
 
-        // Delete the finished study room once everyone is moved out
-        if (isDynamicRoom(studyChannel)) {
-          setTimeout(async () => {
-            const refreshed = await guild.channels.fetch(studyChannel.id).catch(() => null);
-            if (refreshed && refreshed.members.filter((m) => !m.user.bot).size === 0) {
-              dynamicStudyRooms.delete(studyChannel.id);
-              await refreshed.delete('Study session completed and room is empty').catch(() => {});
-            }
-          }, 1500);
-        }
+      // Delete the finished study room once everyone is moved out
+      if (isDynamicRoom(studyChannel)) {
+        setTimeout(async () => {
+          const refreshed = await guild.channels.fetch(studyChannel.id).catch(() => null);
+          if (refreshed && refreshed.members.filter((m) => !m.user.bot).size === 0) {
+            dynamicStudyRooms.delete(studyChannel.id);
+            await refreshed.delete('Study session ended and room is empty').catch(() => {});
+          }
+        }, 1500);
       }
     }
   } catch (err) {
