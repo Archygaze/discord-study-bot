@@ -264,6 +264,31 @@ function buildPromptPayload(studyChannel, isSolo, includeJoinButton = false) {
   return { embeds: [embed], components: [row] };
 }
 
+// Helper: Check if enough invited friends have joined the room to start the timer!
+// Rule:
+// - If 1 friend was invited (total 2 people): wait until everyone (2/2) has joined!
+// - If 2+ friends were invited (total 3+ people): wait until everyone joins OR at most 1 invited person is missing!
+function checkRoomReadyToStart(studyChannel) {
+  const invitedSet = roomInvitedFriends.get(studyChannel.id);
+  const humanMembers = studyChannel.members.filter((m) => !m.user.bot);
+  const presentCount = humanMembers.size;
+
+  if (!invitedSet || invitedSet.size <= 1) {
+    return { ready: presentCount >= 1, presentCount, totalExpected: 1, requiredCount: 1 };
+  }
+
+  const totalExpected = invitedSet.size;
+  const requiredCount = totalExpected <= 2 ? totalExpected : totalExpected - 1;
+  const invitedPresentCount = humanMembers.filter((m) => invitedSet.has(m.id)).size;
+
+  return {
+    ready: invitedPresentCount >= requiredCount,
+    presentCount: invitedPresentCount,
+    totalExpected,
+    requiredCount,
+  };
+}
+
 // Start or resume a locked study session in a specific studyChannel
 async function startFocusSession(
   guild,
@@ -316,9 +341,9 @@ async function startFocusSession(
   const displayMinutes = Math.max(1, Math.ceil(durationMs / 60000));
   const totalMinutes = originalMinutes || displayMinutes;
 
-  for (const userId of participantIds) {
-    lockedUsers.set(userId, studyChannel.id);
-    pausedSessions.delete(userId);
+  for (const m of membersInRoom) {
+    lockedUsers.set(m.id, studyChannel.id);
+    pausedSessions.delete(m.id);
   }
 
   // Lock Method A: Set userLimit to total participant count (including invited friends so they never see "Channel Full"!)
@@ -804,22 +829,43 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
         .catch(() => {});
       return;
     }
+    lockedUsers.set(member.id, joinedChannel.id);
   }
 
-  // 4. User joins a Study Room that has a pending timer from `/focus alone` (when they weren't in voice yet)
+  // 4. User joins a Study Room that has a pending timer (waiting for user or invited friends to join!)
   if (joinedChannel && pendingRoomTimers.has(joinedChannel.id)) {
+    const refreshedJoinChannel = await guild.channels
+      .fetch(joinedChannel.id)
+      .catch(() => joinedChannel);
+    const readiness = checkRoomReadyToStart(refreshedJoinChannel);
     const pending = pendingRoomTimers.get(joinedChannel.id);
-    pendingRoomTimers.delete(joinedChannel.id);
-    const breakChannel = findBreakChannel(guild);
-    await startFocusSession(
-      guild,
-      joinedChannel,
-      breakChannel,
-      pending.durationMs,
-      member.user,
-      pending.isResumed,
-      pending.originalMinutes
-    );
+
+    if (readiness.ready) {
+      pendingRoomTimers.delete(joinedChannel.id);
+      const breakChannel = findBreakChannel(guild);
+      const starterUser =
+        (await client.users.fetch(pending.userId).catch(() => null)) || member.user;
+      await startFocusSession(
+        guild,
+        refreshedJoinChannel,
+        breakChannel,
+        pending.durationMs,
+        starterUser,
+        pending.isResumed,
+        pending.originalMinutes,
+        pending.invitedFriendIds || []
+      );
+    } else {
+      await setVoiceChannelStatus(
+        joinedChannel.id,
+        `⏳ Waiting for friends (${readiness.presentCount}/${readiness.totalExpected} joined)...`
+      );
+      await joinedChannel
+        .send(
+          `👋 <@${member.id}> joined! Waiting for **${readiness.requiredCount - readiness.presentCount}** more invited friend(s) before the **${pending.originalMinutes}-minute** timer starts...`
+        )
+        .catch(() => {});
+    }
     return;
   }
 
@@ -1048,7 +1094,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         // At least 1 person IS in the Study Room voice channel now!
+        // Check if we still need to wait for invited friends before starting the countdown timer
+        const readiness = checkRoomReadyToStart(refreshedRoom);
+
         if (minutes) {
+          if (!readiness.ready) {
+            pendingRoomTimers.set(targetRoom.id, {
+              userId: member.id,
+              durationMs: minutes * 60 * 1000,
+              originalMinutes: minutes,
+              isResumed: false,
+              invitedFriendIds: uniqueFriendIds,
+            });
+            await setVoiceChannelStatus(
+              targetRoom.id,
+              `⏳ Waiting for friends (${readiness.presentCount}/${readiness.totalExpected} joined)...`
+            );
+            const joinRow = new ActionRowBuilder().addComponents(
+              new ButtonBuilder()
+                .setLabel(`Join ${targetRoom.name} (${minutes}m Timer Waiting)`)
+                .setEmoji('🔊')
+                .setStyle(ButtonStyle.Link)
+                .setURL(`https://discord.com/channels/${guild.id}/${targetRoom.id}`)
+            );
+            await targetRoom
+              .send(
+                `⏳ **Waiting for invited friend(s) to join before starting the ${minutes}-minute timer!** (${readiness.presentCount}/${readiness.totalExpected} in voice — needs at least ${readiness.requiredCount})`
+              )
+              .catch(() => {});
+            return interaction.editReply({
+              content:
+                `⏳ Moved to **${targetRoom.name}** (<#${targetRoom.id}>)!${friendSummary}\n` +
+                `⏱️ Your **${minutes}-minute** timer is queued and will **start automatically** once your invited friend(s) join (${readiness.presentCount}/${readiness.totalExpected} here):`,
+              components: [joinRow],
+            });
+          }
+
           const res = await startFocusSession(
             guild,
             targetRoom,
@@ -1079,6 +1160,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
             components,
           });
         } else if (paused && paused.remainingMs > 15000) {
+          const minsLeft = Math.max(1, Math.ceil(paused.remainingMs / 60000));
+          if (!readiness.ready) {
+            pendingRoomTimers.set(targetRoom.id, {
+              userId: member.id,
+              durationMs: paused.remainingMs,
+              originalMinutes: paused.originalMinutes,
+              isResumed: true,
+              invitedFriendIds: uniqueFriendIds,
+            });
+            await setVoiceChannelStatus(
+              targetRoom.id,
+              `⏳ Waiting for friends (${readiness.presentCount}/${readiness.totalExpected} joined)...`
+            );
+            const joinRow = new ActionRowBuilder().addComponents(
+              new ButtonBuilder()
+                .setLabel(`Join ${targetRoom.name} (Resume ${minsLeft}m)`)
+                .setEmoji('🔊')
+                .setStyle(ButtonStyle.Link)
+                .setURL(`https://discord.com/channels/${guild.id}/${targetRoom.id}`)
+            );
+            return interaction.editReply({
+              content:
+                `⏳ Moved to **${targetRoom.name}** (<#${targetRoom.id}>)!${friendSummary}\n` +
+                `🔄 Your paused session (**${minsLeft} mins** left) will **resume automatically** once your invited friend(s) join (${readiness.presentCount}/${readiness.totalExpected} here):`,
+              components: [joinRow],
+            });
+          }
+
           const res = await startFocusSession(
             guild,
             targetRoom,
@@ -1092,7 +1201,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           if (!res.ok) {
             return interaction.editReply(`❌ ${res.error}`);
           }
-          const minsLeft = Math.max(1, Math.ceil(paused.remainingMs / 60000));
           return interaction.editReply(
             `🔄 Moved to **${targetRoom.name}** (<#${targetRoom.id}>) and resumed your previous focus session (**${minsLeft} mins** left)!${friendSummary}`
           );
@@ -1150,12 +1258,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await member.voice.setChannel(studyChannel, 'Starting focus session').catch(() => {});
         }
 
+        const invitedSet = roomInvitedFriends.get(studyChannel.id);
+        const invitedFriendIds = invitedSet ? Array.from(invitedSet) : [];
+
         if (!member.voice.channelId) {
           pendingRoomTimers.set(studyChannel.id, {
             userId: member.id,
             durationMs: minutes * 60 * 1000,
             originalMinutes: minutes,
             isResumed: false,
+            invitedFriendIds,
           });
           const joinRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
@@ -1171,15 +1283,38 @@ client.on(Events.InteractionCreate, async (interaction) => {
           });
         }
 
+        const refreshedStudyChannel = await guild.channels
+          .fetch(studyChannel.id)
+          .catch(() => studyChannel);
+        const readiness = checkRoomReadyToStart(refreshedStudyChannel);
+
+        if (!readiness.ready) {
+          pendingRoomTimers.set(studyChannel.id, {
+            userId: member.id,
+            durationMs: minutes * 60 * 1000,
+            originalMinutes: minutes,
+            isResumed: false,
+            invitedFriendIds,
+          });
+          await setVoiceChannelStatus(
+            studyChannel.id,
+            `⏳ Waiting for friends (${readiness.presentCount}/${readiness.totalExpected} joined)...`
+          );
+          return interaction.reply({
+            content: `⏳ **${minutes}-minute** timer is queued! Waiting for your invited friend(s) to join <#${studyChannel.id}> (${readiness.presentCount}/${readiness.totalExpected} in voice — needs at least ${readiness.requiredCount}) before the countdown starts!`,
+          });
+        }
+
         await interaction.deferUpdate();
         const res = await startFocusSession(
           guild,
-          studyChannel,
+          refreshedStudyChannel,
           breakChannel,
           minutes * 60 * 1000,
           interaction.user,
           false,
-          minutes
+          minutes,
+          invitedFriendIds
         );
         if (!res.ok) {
           await interaction.followUp({
