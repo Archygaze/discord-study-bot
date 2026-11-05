@@ -992,6 +992,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   } catch (err) {
     console.error('Interaction error:', err);
+    const errorMsg =
+      err.code === 50013
+        ? '❌ **Missing Bot Permissions in this server!**\nPlease ask a server admin to go to **Server Settings → Roles → `ILoveStudying`** (or assign a role to `ILoveStudying`) and turn ON:\n• **Administrator** *(easiest)*\n— OR —\n• **Manage Channels**, **Manage Roles**, and **Move Members**!'
+        : `❌ Error: ${err.message}`;
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content: errorMsg }).catch(() => {});
+    } else if (interaction.isRepliable()) {
+      await interaction
+        .reply({ content: errorMsg, flags: MessageFlags.Ephemeral })
+        .catch(() => {});
+    }
   }
 });
 
