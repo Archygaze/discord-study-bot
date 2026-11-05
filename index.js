@@ -23,27 +23,31 @@ const client = new Client({
   ],
 });
 
+const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+
 // Prevent unhandled errors from crashing the bot process
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err);
 });
 
 // Active study sessions per voice channel ID
-// Map<channelId, { guildId, studyChannelId, breakChannelId, participants: Set<userId>, endTime, timeoutId, messageId, durationMinutes }>
+// Map<channelId, { guildId, studyChannelId, breakChannelId, participants: Set<userId>, participantNames: string[], endTime, timeoutId, intervalId, messageId, durationMinutes }>
 const activeSessions = new Map();
 
 // Track which user is locked into which study channel for instant move-back enforcement
 // Map<userId, studyChannelId>
 const lockedUsers = new Map();
 
-// Default channel names (can be overridden in .env or created automatically with /setup-study)
-const STUDY_CHANNEL_NAME = process.env.STUDY_CHANNEL_NAME || '📖 Study Room';
+// Channel naming conventions
+const GROUP_STUDY_NAME = '👥 Study Together';
+const SOLO_STUDY_1_NAME = '🎧 Solo Study 1';
+const SOLO_STUDY_2_NAME = '🎧 Solo Study 2';
 const BREAK_CHANNEL_NAME = process.env.BREAK_CHANNEL_NAME || '☕ Break Lounge';
 
 const commands = [
   new SlashCommandBuilder()
     .setName('setup-study')
-    .setDescription('Automatically creates the Study Room and Break Lounge voice channels')
+    .setDescription('Creates Study Together, Solo Study 1 & 2, and one Break Lounge')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
   new SlashCommandBuilder()
     .setName('focus')
@@ -58,18 +62,19 @@ const commands = [
     ),
   new SlashCommandBuilder()
     .setName('unlock')
-    .setDescription('End the current focus session early and unlock the Study Room'),
+    .setDescription('End the focus session in your current Study Room early'),
 ].map((cmd) => cmd.toJSON());
 
-// Helper: Find Study Room and Break Lounge in a guild
+// Helper: Check if a voice channel is a Study Room
+function isStudyChannel(channel) {
+  if (!channel || channel.type !== ChannelType.GuildVoice) return false;
+  const name = channel.name.toLowerCase();
+  return name.includes('study');
+}
+
+// Helper: Find all Study Rooms and the single Break Lounge in a guild
 function findStudyChannels(guild) {
-  const studyChannel = guild.channels.cache.find(
-    (ch) =>
-      ch.type === ChannelType.GuildVoice &&
-      (ch.id === process.env.STUDY_CHANNEL_ID ||
-        ch.name.toLowerCase().includes('study room') ||
-        ch.name === STUDY_CHANNEL_NAME)
-  );
+  const studyChannels = guild.channels.cache.filter((ch) => isStudyChannel(ch));
 
   const breakChannel = guild.channels.cache.find(
     (ch) =>
@@ -80,36 +85,57 @@ function findStudyChannels(guild) {
         ch.name === BREAK_CHANNEL_NAME)
   );
 
-  return { studyChannel, breakChannel };
+  return { studyChannels, breakChannel };
+}
+
+// Helper: Set Discord Voice Channel Status ("Set a channel status")
+async function setVoiceChannelStatus(channelId, statusText) {
+  try {
+    await rest.put(`/channels/${channelId}/voice-status`, {
+      body: { status: statusText || '' },
+    });
+  } catch (err) {
+    console.error(`Could not update voice status for channel ${channelId}:`, err.message);
+  }
+}
+
+// Helper: Format the voice status string ("username is studying • Xm left")
+function formatStudyStatus(participantNames, minutesLeft) {
+  const names = participantNames.join(', ');
+  const verb = participantNames.length === 1 ? 'is' : 'are';
+  const text = `🔒 ${names} ${verb} studying • ${minutesLeft}m left`;
+  return text.slice(0, 480); // Discord max status length is 500 chars
 }
 
 // Build the prompt message with duration buttons
 function buildPromptPayload(studyChannel) {
+  const isSolo = studyChannel.userLimit === 1 || studyChannel.name.toLowerCase().includes('solo');
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
-    .setTitle('🎓 Ready to Focus?')
+    .setTitle(isSolo ? '🎧 Solo Focus Room' : '👥 Group Focus Room')
     .setDescription(
       `Welcome to **${studyChannel.name}**!\n\n` +
-        `Select a timer below (or use \`/focus <minutes>\`) to **lock the room** and start your focus session:\n` +
-        `• 🔒 **Room Locks:** Nobody else can join while the timer is active.\n` +
+        `Select a timer below (or use \`/focus <minutes>\`) to **lock this room** and start your focus session:\n` +
+        `• 🔒 **Room Locks:** Nobody else can join this room while the timer is active.\n` +
+        `• 💬 **Live Channel Status:** Shows \`[Your Name] is studying • Xm left\` under the channel.\n` +
         `• 🚫 **No Channel Hopping:** Switching to another voice channel will pull you right back here.\n` +
-        `• ☕ **Auto-Break:** When time is up, the room unlocks and moves everyone to the Break Lounge!`
+        `• ☕ **Auto-Break:** When time is up, moves you to **${BREAK_CHANNEL_NAME}**!`
     )
     .setFooter({ text: 'Choose a focus duration below to lock in' });
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId('focus_20')
+      .setCustomId(`focus_20_${studyChannel.id}`)
       .setLabel('20 Min')
       .setEmoji('🍅')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
-      .setCustomId('focus_30')
+      .setCustomId(`focus_30_${studyChannel.id}`)
       .setLabel('30 Min')
       .setEmoji('⏱️')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
-      .setCustomId('focus_60')
+      .setCustomId(`focus_60_${studyChannel.id}`)
       .setLabel('60 Min')
       .setEmoji('🔥')
       .setStyle(ButtonStyle.Success)
@@ -118,7 +144,7 @@ function buildPromptPayload(studyChannel) {
   return { embeds: [embed], components: [row] };
 }
 
-// Start a locked study session
+// Start a locked study session in a specific studyChannel
 async function startFocusSession(guild, studyChannel, breakChannel, durationMinutes, starterUser) {
   if (activeSessions.has(studyChannel.id)) {
     return { ok: false, error: 'A focus session is already running in this room!' };
@@ -130,16 +156,28 @@ async function startFocusSession(guild, studyChannel, breakChannel, durationMinu
   }
 
   const participantIds = new Set(membersInRoom.map((m) => m.id));
+  const participantNames = membersInRoom.map((m) => m.displayName || m.user.username);
 
   try {
-    // 1. Ensure the bot itself keeps Connect/View/Send permissions before locking @everyone!
-    // (In Discord, denying Connect on @everyone also locks out the bot unless the bot has Connect allowed)
+    // 1. Ensure the bot itself keeps Connect/View/Send/Status permissions before locking @everyone!
+    const botAllowPerms = [
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.Connect,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.ManageChannels,
+      PermissionFlagsBits.MoveMembers,
+    ];
+    if (PermissionFlagsBits.SetVoiceChannelStatus) {
+      botAllowPerms.push(PermissionFlagsBits.SetVoiceChannelStatus);
+    }
+
     await studyChannel.permissionOverwrites
       .edit(client.user.id, {
         ViewChannel: true,
         Connect: true,
         SendMessages: true,
         ManageChannels: true,
+        MoveMembers: true,
       })
       .catch(() => {});
 
@@ -165,28 +203,43 @@ async function startFocusSession(guild, studyChannel, breakChannel, durationMinu
     return {
       ok: false,
       error:
-        'Missing Discord permissions to lock the channel! Make sure the bot has **Connect**, **Manage Channels**, and **Manage Roles** (or **Administrator**) permissions in Server Settings -> Roles.',
+        'Missing Discord permissions to lock the channel! Make sure the bot role has **Administrator** (or Connect + Manage Channels + Manage Roles + Set Voice Channel Status) in Server Settings → Roles.',
     };
   }
 
   const endTimeMs = Date.now() + durationMinutes * 60 * 1000;
   const endTimestampSec = Math.floor(endTimeMs / 1000);
 
+  // 4. Set the Voice Channel Status immediately
+  await setVoiceChannelStatus(
+    studyChannel.id,
+    formatStudyStatus(participantNames, durationMinutes)
+  );
+
+  // Update the Voice Channel Status every minute as the timer counts down
+  const intervalId = setInterval(async () => {
+    const remainingMs = endTimeMs - Date.now();
+    if (remainingMs <= 0) return;
+    const minsLeft = Math.max(1, Math.ceil(remainingMs / 60000));
+    await setVoiceChannelStatus(studyChannel.id, formatStudyStatus(participantNames, minsLeft));
+  }, 60 * 1000);
+
   const embed = new EmbedBuilder()
     .setColor(0xed4245)
     .setTitle(`🔒 Focus Session Locked (${durationMinutes} mins)`)
     .setDescription(
-      `Started by <@${starterUser.id}>\n\n` +
+      `Started by <@${starterUser.id}> in **${studyChannel.name}**\n\n` +
+        `💬 **Channel Status:** \`${formatStudyStatus(participantNames, durationMinutes)}\`\n` +
         `⏳ **Ends:** <t:${endTimestampSec}:R> (at <t:${endTimestampSec}:t>)\n` +
-        `👥 **Locked-in Participants:** ${Array.from(participantIds)
+        `👥 **Locked-in:** ${Array.from(participantIds)
           .map((id) => `<@${id}>`)
           .join(', ')}\n\n` +
-        `*The room is now locked to outsiders. Stay focused!*`
+        `*This room is now locked to outsiders. Stay focused!*`
     );
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId('focus_unlock')
+      .setCustomId(`focus_unlock_${studyChannel.id}`)
       .setLabel('End Session & Unlock Early')
       .setEmoji('🔓')
       .setStyle(ButtonStyle.Danger)
@@ -203,8 +256,10 @@ async function startFocusSession(guild, studyChannel, breakChannel, durationMinu
     studyChannelId: studyChannel.id,
     breakChannelId: breakChannel ? breakChannel.id : null,
     participants: participantIds,
+    participantNames,
     endTime: endTimeMs,
     timeoutId,
+    intervalId,
     messageId: msg.id,
     durationMinutes,
   });
@@ -212,12 +267,13 @@ async function startFocusSession(guild, studyChannel, breakChannel, durationMinu
   return { ok: true };
 }
 
-// End a study session, unlock permissions, and move members to Break Lounge
+// End a study session, clear status, unlock permissions, and move members to the single Break Lounge
 async function endFocusSession(studyChannelId, endedEarly = false, endedByUser = null) {
   const session = activeSessions.get(studyChannelId);
   if (!session) return;
 
   clearTimeout(session.timeoutId);
+  clearInterval(session.intervalId);
   activeSessions.delete(studyChannelId);
 
   for (const userId of session.participants) {
@@ -227,12 +283,16 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
   try {
     const guild = await client.guilds.fetch(session.guildId);
     const studyChannel = await guild.channels.fetch(session.studyChannelId).catch(() => null);
+    const { breakChannel: foundBreak } = findStudyChannels(guild);
     const breakChannel = session.breakChannelId
-      ? await guild.channels.fetch(session.breakChannelId).catch(() => null)
-      : null;
+      ? await guild.channels.fetch(session.breakChannelId).catch(() => foundBreak)
+      : foundBreak;
 
     if (studyChannel) {
-      // 1. Unlock @everyone Connect permission
+      // 1. Clear the Voice Channel Status
+      await setVoiceChannelStatus(studyChannel.id, '');
+
+      // 2. Unlock @everyone Connect permission
       await studyChannel.permissionOverwrites
         .edit(guild.roles.everyone, {
           Connect: null,
@@ -252,7 +312,7 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
         }
       }
 
-      // 2. Notify participants
+      // 3. Notify participants
       const mentions = Array.from(session.participants)
         .map((id) => `<@${id}>`)
         .join(' ');
@@ -262,10 +322,10 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
         .setTitle(endedEarly ? '🔓 Focus Session Ended Early' : '🎉 Focus Session Complete!')
         .setDescription(
           endedEarly
-            ? `Session unlocked early${endedByUser ? ` by <@${endedByUser.id}>` : ''}. The room is now open!`
+            ? `Session unlocked early${endedByUser ? ` by <@${endedByUser.id}>` : ''}. **${studyChannel.name}** is now open!`
             : `Great job ${mentions}! You completed **${session.durationMinutes} minutes** of focused study.\n` +
                 (breakChannel
-                  ? `Moving everyone to **${breakChannel.name}** for a well-deserved break!`
+                  ? `Moving you to **${breakChannel.name}** for a well-deserved break!`
                   : `The room is now unlocked!`)
         );
 
@@ -273,7 +333,7 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
         .send({ content: endedEarly ? undefined : mentions, embeds: [doneEmbed] })
         .catch(() => {});
 
-      // 3. Move everyone currently in the Study Room to the Break Lounge (only when timer finishes naturally)
+      // 4. Move everyone currently in this Study Room to the single Break Lounge
       if (!endedEarly && breakChannel) {
         for (const [, member] of studyChannel.members) {
           if (!member.user.bot) {
@@ -290,8 +350,6 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
-  // Register slash commands across all guilds the bot is in
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   try {
     await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
     console.log('✅ Slash commands (/setup-study, /focus, /unlock) registered!');
@@ -299,13 +357,16 @@ client.once(Events.ClientReady, async () => {
     console.error('Failed to register slash commands:', err);
   }
 
-  // Ensure any study channels left locked from a previous restart are unlocked
+  // Ensure any study channels left locked from a previous restart are unlocked and status cleared
   for (const [, guild] of client.guilds.cache) {
-    const { studyChannel } = findStudyChannels(guild);
-    if (studyChannel && !activeSessions.has(studyChannel.id)) {
-      await studyChannel.permissionOverwrites
-        .edit(guild.roles.everyone, { Connect: null })
-        .catch(() => {});
+    const { studyChannels } = findStudyChannels(guild);
+    for (const [, studyChannel] of studyChannels) {
+      if (!activeSessions.has(studyChannel.id)) {
+        await studyChannel.permissionOverwrites
+          .edit(guild.roles.everyone, { Connect: null })
+          .catch(() => {});
+        await setVoiceChannelStatus(studyChannel.id, '');
+      }
     }
   }
 });
@@ -316,9 +377,8 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   if (!member || member.user.bot) return;
 
   const guild = newState.guild || oldState.guild;
-  const { studyChannel } = findStudyChannels(guild);
 
-  // Case 1: User is locked into an active session and tries to switch to a different voice channel
+  // Case 1: User is locked into an active session and tries to switch to ANY other voice channel
   const lockedStudyChannelId = lockedUsers.get(member.id);
   if (
     lockedStudyChannelId &&
@@ -327,7 +387,7 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   ) {
     const targetStudyChannel = guild.channels.cache.get(lockedStudyChannelId);
     if (targetStudyChannel && activeSessions.has(lockedStudyChannelId)) {
-      // Pull them right back into the Study Room!
+      // Pull them right back into their Study Room!
       await member.voice
         .setChannel(targetStudyChannel, 'Locked in active focus session')
         .catch(() => {});
@@ -340,17 +400,18 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     }
   }
 
-  // Case 2: User joins the Study Room when no session is active -> Send timer buttons in voice text chat
+  // Case 2: User joins any Study Room when no session is active in that room -> Send timer buttons
+  const joinedChannel = newState.channel;
   if (
-    studyChannel &&
-    newState.channelId === studyChannel.id &&
-    oldState.channelId !== studyChannel.id
+    joinedChannel &&
+    isStudyChannel(joinedChannel) &&
+    oldState.channelId !== joinedChannel.id
   ) {
-    if (!activeSessions.has(studyChannel.id)) {
-      const humanCount = studyChannel.members.filter((m) => !m.user.bot).size;
-      // Send prompt when the first person enters the unlocked Study Room
+    if (!activeSessions.has(joinedChannel.id)) {
+      const humanCount = joinedChannel.members.filter((m) => !m.user.bot).size;
+      // Send prompt when the first person enters this unlocked Study Room
       if (humanCount === 1) {
-        await studyChannel.send(buildPromptPayload(studyChannel)).catch((err) => {
+        await joinedChannel.send(buildPromptPayload(joinedChannel)).catch((err) => {
           console.error('Could not send prompt to study channel:', err.message);
         });
       }
@@ -368,29 +429,61 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (commandName === 'setup-study') {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
+        // Remove old Study Zone channels if re-running /setup-study so there are no duplicates
+        const existingCategory = guild.channels.cache.find(
+          (c) => c.type === ChannelType.GuildCategory && c.name.includes('STUDY ZONE')
+        );
+        if (existingCategory) {
+          const children = guild.channels.cache.filter((c) => c.parentId === existingCategory.id);
+          for (const [, ch] of children) {
+            await ch.delete('Re-running /setup-study').catch(() => {});
+          }
+          await existingCategory.delete('Re-running /setup-study').catch(() => {});
+        }
+
+        const botOverwrite = {
+          id: client.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.Connect,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ManageChannels,
+            PermissionFlagsBits.MoveMembers,
+          ],
+        };
+
         const category = await guild.channels.create({
           name: '📚 STUDY ZONE',
           type: ChannelType.GuildCategory,
         });
 
-        const studyChannel = await guild.channels.create({
-          name: STUDY_CHANNEL_NAME,
+        // 1. Group Study Room (Unlimited users)
+        const groupChannel = await guild.channels.create({
+          name: GROUP_STUDY_NAME,
           type: ChannelType.GuildVoice,
           parent: category.id,
-          permissionOverwrites: [
-            {
-              id: client.user.id,
-              allow: [
-                PermissionFlagsBits.ViewChannel,
-                PermissionFlagsBits.Connect,
-                PermissionFlagsBits.SendMessages,
-                PermissionFlagsBits.ManageChannels,
-                PermissionFlagsBits.MoveMembers,
-              ],
-            },
-          ],
+          permissionOverwrites: [botOverwrite],
         });
 
+        // 2. Solo Study 1 (1-person room)
+        const solo1Channel = await guild.channels.create({
+          name: SOLO_STUDY_1_NAME,
+          type: ChannelType.GuildVoice,
+          parent: category.id,
+          userLimit: 1,
+          permissionOverwrites: [botOverwrite],
+        });
+
+        // 3. Solo Study 2 (1-person room)
+        const solo2Channel = await guild.channels.create({
+          name: SOLO_STUDY_2_NAME,
+          type: ChannelType.GuildVoice,
+          parent: category.id,
+          userLimit: 1,
+          permissionOverwrites: [botOverwrite],
+        });
+
+        // 4. Single shared Break Lounge
         const breakChannel = await guild.channels.create({
           name: BREAK_CHANNEL_NAME,
           type: ChannelType.GuildVoice,
@@ -398,34 +491,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
 
         return interaction.editReply(
-          `✅ Created study channels!\n` +
-            `• **Study Room:** <#${studyChannel.id}> (Join this room to start a focus timer)\n` +
-            `• **Break Lounge:** <#${breakChannel.id}> (Users are moved here when the timer finishes)`
+          `✅ **Study Zone Created!**\n` +
+            `• 👥 **Group Room:** <#${groupChannel.id}> (Study together with friends)\n` +
+            `• 🎧 **Solo Room 1:** <#${solo1Channel.id}> (1-person room)\n` +
+            `• 🎧 **Solo Room 2:** <#${solo2Channel.id}> (1-person room)\n` +
+            `• ☕ **Shared Break Lounge:** <#${breakChannel.id}> (All study rooms move you here when finished!)`
         );
       }
 
       if (commandName === 'focus') {
         const minutes = interaction.options.getInteger('minutes');
-        const { studyChannel, breakChannel } = findStudyChannels(guild);
+        const currentVoice = member.voice.channel;
 
-        if (!studyChannel) {
+        if (!currentVoice || !isStudyChannel(currentVoice)) {
           return interaction.reply({
-            content: '❌ No Study Room found! Run `/setup-study` first to create the channels.',
+            content: '❌ Join one of the **Study Rooms** first before starting a focus session!',
             flags: MessageFlags.Ephemeral,
           });
         }
 
-        if (member.voice.channelId !== studyChannel.id) {
-          return interaction.reply({
-            content: `❌ Join <#${studyChannel.id}> first before starting a focus session!`,
-            flags: MessageFlags.Ephemeral,
-          });
-        }
-
+        const { breakChannel } = findStudyChannels(guild);
         await interaction.deferReply();
         const res = await startFocusSession(
           guild,
-          studyChannel,
+          currentVoice,
           breakChannel,
           minutes,
           interaction.user
@@ -433,19 +522,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!res.ok) {
           return interaction.editReply(`❌ ${res.error}`);
         }
-        return interaction.editReply(`🔒 Focus session started for **${minutes} minutes**!`);
+        return interaction.editReply(
+          `🔒 Focus session started in <#${currentVoice.id}> for **${minutes} minutes**!`
+        );
       }
 
       if (commandName === 'unlock') {
-        const { studyChannel } = findStudyChannels(guild);
-        if (!studyChannel || !activeSessions.has(studyChannel.id)) {
+        const currentVoice = member.voice.channel;
+        const targetChannelId =
+          currentVoice && activeSessions.has(currentVoice.id)
+            ? currentVoice.id
+            : lockedUsers.get(member.id);
+
+        if (!targetChannelId || !activeSessions.has(targetChannelId)) {
           return interaction.reply({
-            content: 'ℹ️ There is no active focus session right now.',
+            content: 'ℹ️ You are not in an active focus session right now.',
             flags: MessageFlags.Ephemeral,
           });
         }
 
-        await endFocusSession(studyChannel.id, true, interaction.user);
+        await endFocusSession(targetChannelId, true, interaction.user);
         return interaction.reply('🔓 Focus session ended and room unlocked!');
       }
     }
@@ -453,24 +549,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // 2. Button Clicks
     if (interaction.isButton()) {
       const { customId, guild, member } = interaction;
-      const { studyChannel, breakChannel } = findStudyChannels(guild);
+      const { breakChannel } = findStudyChannels(guild);
 
-      if (!studyChannel) {
-        return interaction.reply({
-          content: '❌ Study Room channel not found. Run `/setup-study` first.',
-          flags: MessageFlags.Ephemeral,
-        });
-      }
+      // Start Focus Button: focus_<minutes>_<channelId>
+      if (customId.startsWith('focus_') && !customId.startsWith('focus_unlock')) {
+        const parts = customId.split('_');
+        const minutes = parseInt(parts[1], 10);
+        const targetChannelId = parts[2] || (member.voice && member.voice.channelId);
+        const studyChannel = guild.channels.cache.get(targetChannelId);
 
-      if (customId.startsWith('focus_') && customId !== 'focus_unlock') {
-        if (member.voice.channelId !== studyChannel.id) {
+        if (!studyChannel || member.voice.channelId !== studyChannel.id) {
           return interaction.reply({
-            content: `❌ You must be inside <#${studyChannel.id}> to start the timer!`,
+            content: `❌ You must be inside <#${targetChannelId}> to start its timer!`,
             flags: MessageFlags.Ephemeral,
           });
         }
 
-        const minutes = parseInt(customId.replace('focus_', ''), 10);
         await interaction.deferUpdate();
         const res = await startFocusSession(
           guild,
@@ -488,8 +582,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      if (customId === 'focus_unlock') {
-        const session = activeSessions.get(studyChannel.id);
+      // Unlock Button: focus_unlock_<channelId>
+      if (customId.startsWith('focus_unlock')) {
+        const parts = customId.split('_');
+        const targetChannelId = parts[2] || (member.voice && member.voice.channelId);
+        const session = activeSessions.get(targetChannelId);
+
         if (!session) {
           return interaction.reply({
             content: 'ℹ️ This focus session has already ended.',
@@ -507,7 +605,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         await interaction.deferUpdate();
-        await endFocusSession(studyChannel.id, true, interaction.user);
+        await endFocusSession(targetChannelId, true, interaction.user);
       }
     }
   } catch (err) {
@@ -529,4 +627,3 @@ if (process.env.PORT) {
       console.log(`🌐 Health-check server listening on port ${process.env.PORT}`);
     });
 }
-
