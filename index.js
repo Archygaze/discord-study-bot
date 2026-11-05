@@ -562,6 +562,17 @@ client.once(Events.ClientReady, async () => {
   setInterval(cleanupEmptyStudyRooms, 15000);
 });
 
+// Automatically register slash commands whenever the bot is invited to a brand new server!
+client.on(Events.GuildCreate, async (guild) => {
+  console.log(`🎉 Joined new server: ${guild.name} (${guild.id})`);
+  try {
+    await rest.put(Routes.applicationGuildCommands(client.user.id, guild.id), { body: commands });
+    console.log(`✅ Registered slash commands in new server: ${guild.name}`);
+  } catch (err) {
+    console.error(`Failed to register commands in ${guild.name}:`, err.message);
+  }
+});
+
 // Handle Voice State Updates (Join-to-Create, Pending Timer Auto-Start, Auto-Resume, Hop Prevention, Empty Room Deletion)
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   const member = newState.member || oldState.member;
