@@ -264,10 +264,10 @@ function buildPromptPayload(studyChannel, isSolo, includeJoinButton = false) {
   return { embeds: [embed], components: [row] };
 }
 
-// Helper: Check if enough invited friends have joined the room to start the timer!
+// Helper: Check if all invited friends have joined the room to start the timer automatically!
 // Rule:
-// - If 1 friend was invited (total 2 people): wait until everyone (2/2) has joined!
-// - If 2+ friends were invited (total 3+ people): wait until everyone joins OR at most 1 invited person is missing!
+// - Wait until EVERYONE invited (100% of invited friends) is in the voice channel!
+// - If someone can't make it or is late, the user can click the "▶️ Start Study Session Now" button at any time.
 function checkRoomReadyToStart(studyChannel) {
   const invitedSet = roomInvitedFriends.get(studyChannel.id);
   const humanMembers = studyChannel.members.filter((m) => !m.user.bot);
@@ -278,7 +278,7 @@ function checkRoomReadyToStart(studyChannel) {
   }
 
   const totalExpected = invitedSet.size;
-  const requiredCount = totalExpected <= 2 ? totalExpected : totalExpected - 1;
+  const requiredCount = totalExpected;
   const invitedPresentCount = humanMembers.filter((m) => invitedSet.has(m.id)).size;
 
   return {
@@ -327,12 +327,12 @@ async function startFocusSession(
       const friendMember = await guild.members.fetch(friendId).catch(() => null);
       if (friendMember && !friendMember.user.bot) {
         participantIds.add(friendId);
-        participantNames.push(friendMember.displayName || friendMember.user.username);
         // If they connected to another voice channel in the meantime, pull them right in!
         if (friendMember.voice.channelId && friendMember.voice.channelId !== studyChannel.id) {
           await friendMember.voice
             .setChannel(studyChannel, 'Pulled into locked group study session')
             .catch(() => {});
+          participantNames.push(friendMember.displayName || friendMember.user.username);
         }
       }
     }
@@ -830,6 +830,15 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
       return;
     }
     lockedUsers.set(member.id, joinedChannel.id);
+    const displayName = member.displayName || member.user.username;
+    if (!session.participantNames.includes(displayName)) {
+      session.participantNames.push(displayName);
+      const minsLeft = Math.max(1, Math.ceil((session.endTime - Date.now()) / 60000));
+      await setVoiceChannelStatus(
+        joinedChannel.id,
+        formatStudyStatus(session.participantNames, minsLeft)
+      );
+    }
   }
 
   // 4. User joins a Study Room that has a pending timer (waiting for user or invited friends to join!)
@@ -1057,6 +1066,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
             });
             const joinRow = new ActionRowBuilder().addComponents(
               new ButtonBuilder()
+                .setCustomId(`focus_startnow_${targetRoom.id}`)
+                .setLabel('Start Study Session Now')
+                .setEmoji('▶️')
+                .setStyle(ButtonStyle.Success),
+              new ButtonBuilder()
                 .setLabel(`Click to Join ${targetRoom.name} (${minutes}m Timer Ready)`)
                 .setEmoji('🔊')
                 .setStyle(ButtonStyle.Link)
@@ -1065,7 +1079,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             return interaction.editReply({
               content:
                 `✨ Created **${targetRoom.name}** (<#${targetRoom.id}>) with your **${minutes}-minute** timer ready!${friendSummary}\n` +
-                `Click the button below (or <#${targetRoom.id}>) to connect your voice and lock in:`,
+                `Click **🔊 Join** below to connect your voice (it will wait for everyone invited, or click **▶️ Start Study Session Now**):`,
               components: [joinRow],
             });
           } else if (paused && paused.remainingMs > 15000) {
@@ -1079,6 +1093,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
             });
             const joinRow = new ActionRowBuilder().addComponents(
               new ButtonBuilder()
+                .setCustomId(`focus_startnow_${targetRoom.id}`)
+                .setLabel('Start Study Session Now')
+                .setEmoji('▶️')
+                .setStyle(ButtonStyle.Success),
+              new ButtonBuilder()
                 .setLabel(`Click to Join ${targetRoom.name} (Resume ${minsLeft}m)`)
                 .setEmoji('🔊')
                 .setStyle(ButtonStyle.Link)
@@ -1087,7 +1106,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             return interaction.editReply({
               content:
                 `🔄 Created **${targetRoom.name}** (<#${targetRoom.id}>) to resume your **${minsLeft} mins** left!${friendSummary}\n` +
-                `Click the button below (or <#${targetRoom.id}>) to hop in and auto-lock:`,
+                `Click **🔊 Join** below to hop in (or click **▶️ Start Study Session Now**):`,
               components: [joinRow],
             });
           } else {
@@ -1104,9 +1123,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         // At least 1 person IS in the Study Room voice channel now!
         // Check if we still need to wait for invited friends before starting the countdown timer
         const readiness = checkRoomReadyToStart(refreshedRoom);
+        const mustWaitForFriends = !readiness.ready || offlineVoiceFriends.length > 0;
+        const totalExpectedCount = uniqueFriendIds.length > 0 ? uniqueFriendIds.length + 1 : readiness.totalExpected;
+        const presentInVoiceCount = Math.min(totalExpectedCount, Math.max(1, 1 + movedFriends.length));
 
         if (minutes) {
-          if (!readiness.ready) {
+          if (mustWaitForFriends) {
             pendingRoomTimers.set(targetRoom.id, {
               userId: member.id,
               durationMs: minutes * 60 * 1000,
@@ -1116,7 +1138,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             });
             await setVoiceChannelStatus(
               targetRoom.id,
-              `⏳ Waiting for friends (${readiness.presentCount}/${readiness.totalExpected} joined)...`
+              `⏳ Waiting for friends (${presentInVoiceCount}/${totalExpectedCount} joined)...`
             );
             const joinRow = new ActionRowBuilder().addComponents(
               new ButtonBuilder()
@@ -1132,14 +1154,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
             );
             await targetRoom
               .send({
-                content: `⏳ **Waiting for invited friend(s) to join before starting the ${minutes}-minute timer!** (${readiness.presentCount}/${readiness.totalExpected} in voice — needs at least ${readiness.requiredCount}, or click **Start Study Session Now** below)`,
+                content: `⏳ **Waiting for all invited friends to join before starting the ${minutes}-minute timer!** (${presentInVoiceCount}/${totalExpectedCount} in voice — or click **▶️ Start Study Session Now** below to start without waiting)`,
                 components: [joinRow],
               })
               .catch(() => {});
             return interaction.editReply({
               content:
                 `⏳ Moved to **${targetRoom.name}** (<#${targetRoom.id}>)!${friendSummary}\n` +
-                `⏱️ Your **${minutes}-minute** timer is queued and will **start automatically** once your invited friend(s) join (${readiness.presentCount}/${readiness.totalExpected} here) — or click **Start Study Session Now**:`,
+                `⏱️ Your **${minutes}-minute** timer is waiting until **everyone invited (${presentInVoiceCount}/${totalExpectedCount})** joins — or click **▶️ Start Study Session Now** below to start immediately:`,
               components: [joinRow],
             });
           }
