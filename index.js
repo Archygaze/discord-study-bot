@@ -533,9 +533,9 @@ client.once(Events.ClientReady, async () => {
     status: 'online',
     activities: [
       {
-        name: '📚 /focus alone • Lock in & Study!',
+        name: 'im here trying to help',
         type: ActivityType.Custom,
-        state: '📚 /focus alone • Lock in & Study!',
+        state: 'im here trying to help',
       },
     ],
   });
