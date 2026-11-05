@@ -41,8 +41,9 @@ jobs:
           timeout 19200s node index.js || true
 
       - name: Automatically trigger next 24/7 cycle
-        if: always()
+        if: "!cancelled()"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh workflow run "24/7 Discord Study Bot" --ref master || true
+

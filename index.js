@@ -1000,18 +1000,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
             null,
             member.voice.channelId ? 20000 : 60000
           );
-
-          // Move the command user if they are in a voice channel
-          if (member.voice.channelId) {
-            await member.voice
-              .setChannel(targetRoom, `Moved via /study ${subcommand}`)
-              .catch((err) => {
-                console.error('Failed to move member to study room:', err.message);
-              });
-          }
         }
 
-        // Store invited friends on targetRoom so they are always allowed in even after locking!
+        // Store invited friends on targetRoom BEFORE moving anyone in, so VoiceStateUpdate always knows who is invited!
         if (uniqueFriendIds.length > 0) {
           const invSet = roomInvitedFriends.get(targetRoom.id) || new Set();
           invSet.add(member.id);
@@ -1022,6 +1013,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
               .catch(() => {});
           }
           roomInvitedFriends.set(targetRoom.id, invSet);
+        }
+
+        // Move the command user if they are in a voice channel and not already in targetRoom
+        if (!alreadyInMatchingStudyRoom && member.voice.channelId) {
+          await member.voice
+            .setChannel(targetRoom, `Moved via /study ${subcommand}`)
+            .catch((err) => {
+              console.error('Failed to move member to study room:', err.message);
+            });
         }
 
         // If /study together had tagged friend(s), move any tagged friends who are in voice into targetRoom too!
