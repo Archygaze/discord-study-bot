@@ -536,7 +536,7 @@ client.once(Events.ClientReady, async () => {
   setInterval(cleanupEmptyStudyRooms, 15000);
 });
 
-// Automatically register slash commands whenever the bot is invited to a brand new server!
+// Automatically register slash commands AND create the Study Zone channels whenever the bot is added to a new server!
 client.on(Events.GuildCreate, async (guild) => {
   console.log(`🎉 Joined new server: ${guild.name} (${guild.id})`);
   try {
@@ -544,6 +544,38 @@ client.on(Events.GuildCreate, async (guild) => {
     console.log(`✅ Registered slash commands in new server: ${guild.name}`);
   } catch (err) {
     console.error(`Failed to register commands in ${guild.name}:`, err.message);
+  }
+
+  // Auto-create 📚 STUDY ZONE right when added to the server if it doesn't exist yet!
+  try {
+    await guild.channels.fetch().catch(() => {});
+    const existingCategory = guild.channels.cache.find(
+      (c) => c.type === ChannelType.GuildCategory && c.name.includes('STUDY ZONE')
+    );
+    if (!existingCategory) {
+      const category = await guild.channels.create({
+        name: '📚 STUDY ZONE',
+        type: ChannelType.GuildCategory,
+      });
+      await guild.channels.create({
+        name: CREATE_SOLO_NAME,
+        type: ChannelType.GuildVoice,
+        parent: category.id,
+      });
+      await guild.channels.create({
+        name: CREATE_GROUP_NAME,
+        type: ChannelType.GuildVoice,
+        parent: category.id,
+      });
+      await guild.channels.create({
+        name: BREAK_CHANNEL_NAME,
+        type: ChannelType.GuildVoice,
+        parent: category.id,
+      });
+      console.log(`✅ Auto-created STUDY ZONE channels in ${guild.name}!`);
+    }
+  } catch (err) {
+    console.error(`Could not auto-create study channels in ${guild.name}:`, err.message);
   }
 });
 
