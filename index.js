@@ -43,9 +43,13 @@ const lockedUsers = new Map();
 // Map<userId, { remainingMs: number, originalMinutes: number }>
 const pausedSessions = new Map();
 
-// Track pending timers when a user runs /focus alone from text chat before connecting to voice
-// Map<channelId, { userId: string, durationMs: number, originalMinutes: number, isResumed: boolean }>
+// Track pending timers when a user runs /study from text chat before connecting to voice
+// Map<channelId, { userId: string, durationMs: number, originalMinutes: number, isResumed: boolean, invitedFriendIds?: string[] }>
 const pendingRoomTimers = new Map();
+
+// Track friends invited to a specific Study Room via /study together so they are always allowed in & pulled in
+// Map<channelId, Set<userId>>
+const roomInvitedFriends = new Map();
 
 // Track dynamically spawned study rooms so they auto-delete when empty
 // Set<channelId>
@@ -268,7 +272,8 @@ async function startFocusSession(
   durationMs,
   starterUser,
   isResumed = false,
-  originalMinutes = null
+  originalMinutes = null,
+  extraInvitedIds = []
 ) {
   if (activeSessions.has(studyChannel.id)) {
     return { ok: false, error: 'A focus session is already running in this room!' };
@@ -280,12 +285,34 @@ async function startFocusSession(
   if (membersInRoom.length === 0) {
     return {
       ok: false,
-      error: `Join <#${studyChannel.id}> first to start the focus timer!`,
+      error: `Join **${studyChannel.name}** (<#${studyChannel.id}>) first to start the focus timer!`,
     };
   }
 
   const participantIds = new Set(membersInRoom.map((m) => m.id));
   const participantNames = membersInRoom.map((m) => m.displayName || m.user.username);
+
+  // Also include any friends who were invited via /study together (even if they haven't connected their voice yet!)
+  const invitedSet = roomInvitedFriends.get(studyChannel.id) || new Set();
+  for (const id of extraInvitedIds) {
+    invitedSet.add(id);
+  }
+  for (const friendId of invitedSet) {
+    if (!participantIds.has(friendId)) {
+      const friendMember = await guild.members.fetch(friendId).catch(() => null);
+      if (friendMember && !friendMember.user.bot) {
+        participantIds.add(friendId);
+        participantNames.push(friendMember.displayName || friendMember.user.username);
+        // If they connected to another voice channel in the meantime, pull them right in!
+        if (friendMember.voice.channelId && friendMember.voice.channelId !== studyChannel.id) {
+          await friendMember.voice
+            .setChannel(studyChannel, 'Pulled into locked group study session')
+            .catch(() => {});
+        }
+      }
+    }
+  }
+
   const displayMinutes = Math.max(1, Math.ceil(durationMs / 60000));
   const totalMinutes = originalMinutes || displayMinutes;
 
@@ -294,10 +321,10 @@ async function startFocusSession(
     pausedSessions.delete(userId);
   }
 
-  // Lock Method A: Set userLimit to exact participant count (only requires Manage Channels!)
+  // Lock Method A: Set userLimit to total participant count (including invited friends so they never see "Channel Full"!)
   await studyChannel.setUserLimit(Math.max(1, participantIds.size)).catch(() => {});
 
-  // Lock Method B: Also apply permission overwrites if the bot has Manage Roles in this server
+  // Lock Method B: Grant Connect + ViewChannel to every participant & invited friend BEFORE denying @everyone
   try {
     await studyChannel.permissionOverwrites.edit(client.user.id, {
       ViewChannel: true,
@@ -307,7 +334,10 @@ async function startFocusSession(
       MoveMembers: true,
     });
     for (const userId of participantIds) {
-      await studyChannel.permissionOverwrites.edit(userId, { Connect: true });
+      await studyChannel.permissionOverwrites.edit(userId, {
+        ViewChannel: true,
+        Connect: true,
+      });
     }
     await studyChannel.permissionOverwrites.edit(guild.roles.everyone, { Connect: false });
   } catch {
@@ -388,6 +418,7 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
   clearTimeout(session.timeoutId);
   clearInterval(session.intervalId);
   activeSessions.delete(studyChannelId);
+  roomInvitedFriends.delete(studyChannelId);
 
   for (const userId of session.participants) {
     lockedUsers.delete(userId);
@@ -698,7 +729,20 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     }
   }
 
-  // 2. Check if the channel the user just left is now empty -> Pause session (if active) & delete the room!
+  // 1.5. If user was invited to an active/pending Group Study Room and just connected to ANY voice channel, pull them into their Study Room!
+  if (newState.channelId && !oldState.channelId) {
+    for (const [roomId, invitedSet] of roomInvitedFriends.entries()) {
+      if (invitedSet.has(member.id) && newState.channelId !== roomId) {
+        const invitedRoom = guild.channels.cache.get(roomId);
+        if (invitedRoom) {
+          await member.voice
+            .setChannel(invitedRoom, 'Joined voice after being invited via /study together')
+            .catch(() => {});
+          return;
+        }
+      }
+    }
+  }
   const leftChannel = oldState.channel;
   if (leftChannel && isDynamicRoom(leftChannel) && leftChannel.id !== newState.channelId) {
     const remainingHumans = leftChannel.members.filter((m) => !m.user.bot).size;
@@ -904,6 +948,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
 
+        // Store invited friends on targetRoom so they are always allowed in even after locking!
+        if (uniqueFriendIds.length > 0) {
+          const invSet = roomInvitedFriends.get(targetRoom.id) || new Set();
+          invSet.add(member.id);
+          for (const fid of uniqueFriendIds) {
+            invSet.add(fid);
+            await targetRoom.permissionOverwrites
+              .edit(fid, { ViewChannel: true, Connect: true })
+              .catch(() => {});
+          }
+          roomInvitedFriends.set(targetRoom.id, invSet);
+        }
+
         // If /study together had tagged friend(s), move any tagged friends who are in voice into targetRoom too!
         const movedFriends = [];
         const offlineVoiceFriends = [];
@@ -928,7 +985,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             ? `\n👥 **Pulled into voice with you:** ${movedFriends.join(', ')}`
             : '') +
           (offlineVoiceFriends.length > 0
-            ? `\n🔔 **Invited to join <#${targetRoom.id}>:** ${offlineVoiceFriends.join(', ')} *(hop into voice!)*`
+            ? `\n🔔 **Invited to join ${targetRoom.name} (<#${targetRoom.id}>):** ${offlineVoiceFriends.join(', ')} *(click the room or button below to hop in!)*`
             : '');
 
         // Check if nobody is in the targetRoom yet (neither caller nor tagged friends were in voice)
@@ -942,6 +999,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
               durationMs: minutes * 60 * 1000,
               originalMinutes: minutes,
               isResumed: false,
+              invitedFriendIds: uniqueFriendIds,
             });
             const joinRow = new ActionRowBuilder().addComponents(
               new ButtonBuilder()
@@ -952,7 +1010,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             );
             return interaction.editReply({
               content:
-                `✨ Created <#${targetRoom.id}> with your **${minutes}-minute** timer ready!${friendSummary}\n` +
+                `✨ Created **${targetRoom.name}** (<#${targetRoom.id}>) with your **${minutes}-minute** timer ready!${friendSummary}\n` +
                 `Click the button below (or <#${targetRoom.id}>) to connect your voice and lock in:`,
               components: [joinRow],
             });
@@ -963,6 +1021,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
               durationMs: paused.remainingMs,
               originalMinutes: paused.originalMinutes,
               isResumed: true,
+              invitedFriendIds: uniqueFriendIds,
             });
             const joinRow = new ActionRowBuilder().addComponents(
               new ButtonBuilder()
@@ -973,7 +1032,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             );
             return interaction.editReply({
               content:
-                `🔄 Created <#${targetRoom.id}> to resume your **${minsLeft} mins** left!${friendSummary}\n` +
+                `🔄 Created **${targetRoom.name}** (<#${targetRoom.id}>) to resume your **${minsLeft} mins** left!${friendSummary}\n` +
                 `Click the button below (or <#${targetRoom.id}>) to hop in and auto-lock:`,
               components: [joinRow],
             });
@@ -982,7 +1041,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await targetRoom.send(buildPromptPayload(targetRoom, isSolo, false)).catch(() => {});
             return interaction.editReply({
               content:
-                `✨ Created <#${targetRoom.id}>!${friendSummary}\nClick **🔊 Join ${targetRoom.name}** below (or <#${targetRoom.id}>), then pick your timer:`,
+                `✨ Created **${targetRoom.name}** (<#${targetRoom.id}>)!${friendSummary}\nClick **🔊 Join ${targetRoom.name}** below (or <#${targetRoom.id}>), then pick your timer:`,
               ...promptPayload,
             });
           }
@@ -997,14 +1056,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
             minutes * 60 * 1000,
             interaction.user,
             false,
-            minutes
+            minutes,
+            uniqueFriendIds
           );
           if (!res.ok) {
             return interaction.editReply(`❌ ${res.error}`);
           }
-          return interaction.editReply(
-            `🔒 Moved to <#${targetRoom.id}> and locked in a **${minutes}-minute** focus session!${friendSummary}`
-          );
+          const components = [];
+          if (offlineVoiceFriends.length > 0) {
+            components.push(
+              new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                  .setLabel(`Join ${targetRoom.name}`)
+                  .setEmoji('🔊')
+                  .setStyle(ButtonStyle.Link)
+                  .setURL(`https://discord.com/channels/${guild.id}/${targetRoom.id}`)
+              )
+            );
+          }
+          return interaction.editReply({
+            content: `🔒 Moved to **${targetRoom.name}** (<#${targetRoom.id}>) and locked in a **${minutes}-minute** focus session!${friendSummary}`,
+            components,
+          });
         } else if (paused && paused.remainingMs > 15000) {
           const res = await startFocusSession(
             guild,
@@ -1013,20 +1086,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
             paused.remainingMs,
             interaction.user,
             true,
-            paused.originalMinutes
+            paused.originalMinutes,
+            uniqueFriendIds
           );
           if (!res.ok) {
             return interaction.editReply(`❌ ${res.error}`);
           }
           const minsLeft = Math.max(1, Math.ceil(paused.remainingMs / 60000));
           return interaction.editReply(
-            `🔄 Moved to <#${targetRoom.id}> and resumed your previous focus session (**${minsLeft} mins** left)!${friendSummary}`
+            `🔄 Moved to **${targetRoom.name}** (<#${targetRoom.id}>) and resumed your previous focus session (**${minsLeft} mins** left)!${friendSummary}`
           );
         } else {
           const promptPayload = buildPromptPayload(targetRoom, isSolo, offlineVoiceFriends.length > 0);
           await targetRoom.send(buildPromptPayload(targetRoom, isSolo, false)).catch(() => {});
           return interaction.editReply({
-            content: `✅ Moved into <#${targetRoom.id}>!${friendSummary}\nPick your focus timer below:`,
+            content: `✅ Moved into **${targetRoom.name}** (<#${targetRoom.id}>)!${friendSummary}\nPick your focus timer below:`,
             ...promptPayload,
           });
         }
