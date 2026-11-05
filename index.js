@@ -464,13 +464,14 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
   }
 }
 
-// Helper: Sweep and delete any empty dynamic study rooms in all guilds
+// Helper: Sweep and delete any empty dynamic study rooms AND recover/finish any sessions across cloud restarts
 async function cleanupEmptyStudyRooms() {
   for (const [, guild] of client.guilds.cache) {
     await guild.channels.fetch().catch(() => {});
     for (const [, ch] of guild.channels.cache) {
       if (isDynamicRoom(ch) && !spawningRooms.has(ch.id)) {
-        const humans = ch.members.filter((m) => !m.user.bot).size;
+        const humanMembers = ch.members.filter((m) => !m.user.bot);
+        const humans = humanMembers.size;
         if (humans === 0) {
           if (activeSessions.has(ch.id)) {
             const session = activeSessions.get(ch.id);
@@ -491,6 +492,89 @@ async function cleanupEmptyStudyRooms() {
           pendingRoomTimers.delete(ch.id);
           dynamicStudyRooms.delete(ch.id);
           await ch.delete('Cleaning up empty dynamic study room').catch(() => {});
+        } else if (!activeSessions.has(ch.id)) {
+          // Check if this room has an active or expired timer message from before a cloud restart!
+          try {
+            const messages = await ch.messages.fetch({ limit: 10 });
+            const lockMsg = messages.find(
+              (m) =>
+                m.author.id === client.user.id &&
+                m.embeds.length > 0 &&
+                m.components.length > 0 &&
+                m.embeds[0].description &&
+                m.embeds[0].description.includes('<t:')
+            );
+            if (lockMsg) {
+              const desc = lockMsg.embeds[0].description;
+              const title = lockMsg.embeds[0].title || '';
+              const timeMatch = desc.match(/<t:(\d+):R>/);
+              const durMatch = title.match(/\((\d+)\s*mins?/i);
+              if (timeMatch) {
+                const endTimeMs = parseInt(timeMatch[1], 10) * 1000;
+                const durationMinutes = durMatch ? parseInt(durMatch[1], 10) : 20;
+                const participantIds = new Set(humanMembers.map((m) => m.id));
+                const participantNames = humanMembers.map(
+                  (m) => m.displayName || m.user.username
+                );
+                const breakChannel = findBreakChannel(guild);
+                const remainingMs = endTimeMs - Date.now();
+
+                for (const uid of participantIds) {
+                  lockedUsers.set(uid, ch.id);
+                }
+
+                if (remainingMs <= 0) {
+                  // Timer already finished during cloud restart -> End session & move to Break Lounge immediately!
+                  activeSessions.set(ch.id, {
+                    guildId: guild.id,
+                    studyChannelId: ch.id,
+                    breakChannelId: breakChannel ? breakChannel.id : null,
+                    participants: participantIds,
+                    participantNames,
+                    endTime: endTimeMs,
+                    timeoutId: null,
+                    intervalId: null,
+                    messageId: lockMsg.id,
+                    durationMinutes,
+                  });
+                  await endFocusSession(ch.id, false);
+                } else {
+                  // Restore active timer seamlessly!
+                  const intervalId = setInterval(async () => {
+                    const rem = endTimeMs - Date.now();
+                    if (rem <= 0) return;
+                    const minsLeft = Math.max(1, Math.ceil(rem / 60000));
+                    await setVoiceChannelStatus(
+                      ch.id,
+                      formatStudyStatus(participantNames, minsLeft)
+                    );
+                  }, 60 * 1000);
+
+                  const timeoutId = setTimeout(() => {
+                    endFocusSession(ch.id, false);
+                  }, remainingMs);
+
+                  activeSessions.set(ch.id, {
+                    guildId: guild.id,
+                    studyChannelId: ch.id,
+                    breakChannelId: breakChannel ? breakChannel.id : null,
+                    participants: participantIds,
+                    participantNames,
+                    endTime: endTimeMs,
+                    timeoutId,
+                    intervalId,
+                    messageId: lockMsg.id,
+                    durationMinutes,
+                  });
+                  console.log(
+                    `🔄 Recovered active session in ${ch.name} (${Math.ceil(remainingMs / 60000)}m left)`
+                  );
+                }
+              }
+            }
+          } catch {
+            // Ignore fetch errors
+          }
         }
       }
     }
@@ -1037,8 +1121,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const parts = customId.split('_');
         const targetChannelId = parts[2] || (member.voice && member.voice.channelId);
         const session = activeSessions.get(targetChannelId);
+        const studyChannel = guild.channels.cache.get(targetChannelId);
 
         if (!session) {
+          if (studyChannel && isDynamicRoom(studyChannel)) {
+            await interaction.deferUpdate();
+            if (breakChannel) {
+              for (const [, m] of studyChannel.members) {
+                if (!m.user.bot) {
+                  await m.voice.setChannel(breakChannel, 'Session ended').catch(() => {});
+                }
+              }
+            }
+            setTimeout(async () => {
+              await studyChannel.delete('Study session ended').catch(() => {});
+            }, 3500);
+            return;
+          }
           return interaction.reply({
             content: 'ℹ️ This focus session has already ended.',
             flags: MessageFlags.Ephemeral,
