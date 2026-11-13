@@ -383,29 +383,8 @@ async function startFocusSession(
     };
   }
 
-  const participantIds = new Set(membersInRoom.map((m) => m.id));
-  const participantNames = membersInRoom.map((m) => m.displayName || m.user.username);
-
-  // Also include any friends who were invited via /study together (even if they haven't connected their voice yet!)
-  const invitedSet = roomInvitedFriends.get(studyChannel.id) || new Set();
-  for (const id of extraInvitedIds) {
-    invitedSet.add(id);
-  }
-  for (const friendId of invitedSet) {
-    if (!participantIds.has(friendId)) {
-      const friendMember = await guild.members.fetch(friendId).catch(() => null);
-      if (friendMember && !friendMember.user.bot) {
-        participantIds.add(friendId);
-        // If they connected to another voice channel in the meantime, pull them right in!
-        if (friendMember.voice.channelId && friendMember.voice.channelId !== studyChannel.id) {
-          await friendMember.voice
-            .setChannel(studyChannel, 'Pulled into locked group study session')
-            .catch(() => {});
-          participantNames.push(friendMember.displayName || friendMember.user.username);
-        }
-      }
-    }
-  }
+  let participantIds;
+  let participantNames;
 
   const isPomodoro = !!pomodoroOptions;
   const isSeparateRooms = !!(pomodoroOptions && pomodoroOptions.isSeparateRooms);
@@ -428,13 +407,30 @@ async function startFocusSession(
     : new Set([studyChannel.id]);
 
   if (isSeparateRooms && pomodoroOptions.userRooms) {
+    const userRoomsEntries =
+      pomodoroOptions.userRooms instanceof Map
+        ? Array.from(pomodoroOptions.userRooms.entries())
+        : Object.entries(pomodoroOptions.userRooms);
+
+    participantIds = new Set(userRoomsEntries.map(([uid]) => uid));
+    participantNames = [];
+
     // Parallel Solo Study: lock each member into their own private 1-person cubicle
-    for (const [uid, rId] of pomodoroOptions.userRooms.entries()) {
+    for (const [uid, rId] of userRoomsEntries) {
       lockedUsers.set(uid, rId);
       pausedSessions.delete(uid);
 
       const mem = await guild.members.fetch(uid).catch(() => null);
       const name = mem ? (mem.displayName || mem.user.username) : 'Student';
+      participantNames.push(name);
+
+      // Make sure the member is in their OWN cubicle, NOT anyone else's!
+      if (mem && mem.voice && mem.voice.channelId && mem.voice.channelId !== rId) {
+        await mem.voice
+          .setChannel(rId, 'Moved to private focus cubicle')
+          .catch(() => {});
+      }
+
       await setVoiceChannelStatus(
         rId,
         formatPomoStudyStatus([name], currentRound, totalRounds, displayMinutes)
@@ -442,6 +438,8 @@ async function startFocusSession(
 
       const cubicleCh = await guild.channels.fetch(rId).catch(() => null);
       if (cubicleCh) {
+        await cubicleCh.setUserLimit(1).catch(() => {});
+
         const cubicleEmbed = new EmbedBuilder()
           .setColor(0xed4245)
           .setTitle(`🍅 Private Focus Cubicle — Round ${currentRound}/${totalRounds} (${displayMinutes}m)`)
@@ -472,6 +470,30 @@ async function startFocusSession(
     }
   } else {
     // Standard shared study room
+    participantIds = new Set(membersInRoom.map((m) => m.id));
+    participantNames = membersInRoom.map((m) => m.displayName || m.user.username);
+
+    // Also include any friends who were invited via /study together (even if they haven't connected their voice yet!)
+    const invitedSet = roomInvitedFriends.get(studyChannel.id) || new Set();
+    for (const id of extraInvitedIds) {
+      invitedSet.add(id);
+    }
+    for (const friendId of invitedSet) {
+      if (!participantIds.has(friendId)) {
+        const friendMember = await guild.members.fetch(friendId).catch(() => null);
+        if (friendMember && !friendMember.user.bot) {
+          participantIds.add(friendId);
+          // If they connected to another voice channel in the meantime, pull them right in!
+          if (friendMember.voice.channelId && friendMember.voice.channelId !== studyChannel.id) {
+            await friendMember.voice
+              .setChannel(studyChannel, 'Pulled into locked group study session')
+              .catch(() => {});
+            participantNames.push(friendMember.displayName || friendMember.user.username);
+          }
+        }
+      }
+    }
+
     for (const m of membersInRoom) {
       lockedUsers.set(m.id, studyChannel.id);
       pausedSessions.delete(m.id);
