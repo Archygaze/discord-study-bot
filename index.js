@@ -88,44 +88,20 @@ const commands = [
     .addSubcommand((sub) =>
       sub
         .setName('together')
-        .setDescription('Create & move into a Pomodoro Group Study Room together with your friends!')
+        .setDescription('Automatic Pomodoro study with friends & automated Break Lounge breaks!')
         .addStringOption((opt) =>
           opt
             .setName('friends')
-            .setDescription('Tag as many friends as you want! (e.g. @friend1 @friend2 @friend3...)')
+            .setDescription('Tag friends to study with (optional, e.g. @friend1 @friend2)')
             .setRequired(false)
         )
         .addIntegerOption((opt) =>
           opt
-            .setName('study_minutes')
-            .setDescription('Study time per round in minutes (default: 25)')
-            .setRequired(false)
-            .setMinValue(1)
-            .setMaxValue(240)
-        )
-        .addIntegerOption((opt) =>
-          opt
-            .setName('break_minutes')
-            .setDescription('Break time per round in minutes (default: 5)')
-            .setRequired(false)
-            .setMinValue(1)
-            .setMaxValue(60)
-        )
-        .addIntegerOption((opt) =>
-          opt
-            .setName('rounds')
-            .setDescription('Number of study & break rounds (default: 4)')
+            .setName('hours')
+            .setDescription('Total study hours (optional — default: 2 hrs = 4 rounds of 25m study + 5m break)')
             .setRequired(false)
             .setMinValue(1)
             .setMaxValue(24)
-        )
-        .addIntegerOption((opt) =>
-          opt
-            .setName('minutes')
-            .setDescription('Quick study minutes (legacy shortcut)')
-            .setRequired(false)
-            .setMinValue(1)
-            .setMaxValue(240)
         )
     ),
   new SlashCommandBuilder()
@@ -1409,27 +1385,31 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (commandName === 'study' || commandName === 'focus') {
         const subcommand = interaction.options.getSubcommand(false) || 'alone';
         const isSolo = subcommand === 'alone';
-        const studyMinOpt = interaction.options.getInteger('study_minutes');
-        const breakMinOpt = interaction.options.getInteger('break_minutes');
-        const roundsOpt = interaction.options.getInteger('rounds');
-        const legacyMinutes = interaction.options.getInteger('minutes');
-
-        const hasCustomPomo = !isSolo && (studyMinOpt || breakMinOpt || roundsOpt || legacyMinutes);
-        const pomodoroOptions = hasCustomPomo
-          ? {
-              isPomodoro: true,
-              studyMinutes: studyMinOpt || legacyMinutes || 25,
-              breakMinutes: breakMinOpt || 5,
-              totalRounds: roundsOpt || 4,
-              currentRound: 1,
-            }
-          : null;
-        const minutes = isSolo
-          ? legacyMinutes || studyMinOpt
-          : pomodoroOptions
-            ? pomodoroOptions.studyMinutes
-            : null;
+        const hoursOpt = interaction.options.getInteger('hours');
+        const minutesOpt = interaction.options.getInteger('minutes');
         const breakChannel = findBreakChannel(guild);
+
+        let pomodoroOptions = null;
+        let minutes = null;
+
+        if (isSolo) {
+          minutes = minutesOpt || 25;
+        } else {
+          // /study together ALWAYS runs an automated Pomodoro cycle!
+          // Default: 2 hours = 4 rounds of (25m study + 5m break in Break Lounge)
+          const totalRounds = hoursOpt ? Math.max(1, hoursOpt * 2) : 4;
+          const studyMinutes = 25;
+          const breakMinutes = 5;
+
+          pomodoroOptions = {
+            isPomodoro: true,
+            studyMinutes,
+            breakMinutes,
+            totalRounds,
+            currentRound: 1,
+          };
+          minutes = studyMinutes;
+        }
 
         // Collect any number of @mentioned friends from the 'friends' string option!
         const friendsRaw = interaction.options.getString('friends') || '';
