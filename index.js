@@ -98,10 +98,23 @@ const commands = [
         .addIntegerOption((opt) =>
           opt
             .setName('hours')
-            .setDescription('Total study hours (optional — default: 2 hrs = 4 rounds of 25m study + 5m break)')
+            .setDescription('Total study hours (optional — default: 2 hrs = 4 rounds)')
             .setRequired(false)
             .setMinValue(1)
             .setMaxValue(24)
+        )
+        .addIntegerOption((opt) =>
+          opt
+            .setName('break_minutes')
+            .setDescription('Break time per round (optional — choices: 5, 10, 15, 20, 30. Default: 5)')
+            .setRequired(false)
+            .addChoices(
+              { name: '5 minutes (Standard)', value: 5 },
+              { name: '10 minutes', value: 10 },
+              { name: '15 minutes (Long Break)', value: 15 },
+              { name: '20 minutes', value: 20 },
+              { name: '30 minutes', value: 30 }
+            )
         )
         .addBooleanOption((opt) =>
           opt
@@ -684,9 +697,14 @@ async function transitionToPomodoroBreak(studyChannelId) {
     const breakRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId(`pomo_skipbreak_${session.studyChannelId}`)
-        .setLabel('Skip Break & Resume Study Now')
+        .setLabel('Skip Break & Resume Study')
         .setEmoji('▶️')
         .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`pomo_extendbreak_${session.studyChannelId}`)
+        .setLabel('+5m Break')
+        .setEmoji('⏳')
+        .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId(`focus_unlock_${session.studyChannelId}`)
         .setLabel('End Session Early')
@@ -1587,10 +1605,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
           minutes = minutesOpt || 25;
         } else {
           // /study together ALWAYS runs an automated Pomodoro cycle!
-          // Default: 2 hours = 4 rounds of (25m study + 5m break in Break Lounge)
-          const totalRounds = hoursOpt ? Math.max(1, hoursOpt * 2) : 4;
+          const breakMinutesOpt = interaction.options.getInteger('break_minutes');
           const studyMinutes = 25;
-          const breakMinutes = 5;
+          const breakMinutes = breakMinutesOpt || 5;
+          const roundLength = studyMinutes + breakMinutes;
+          const totalRounds = hoursOpt ? Math.max(1, Math.round((hoursOpt * 60) / roundLength)) : 4;
 
           pomodoroOptions = {
             isPomodoro: true,
@@ -2144,6 +2163,50 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.deferUpdate();
         await resumePomodoroStudy(targetChannelId);
         return;
+      }
+
+      // Extend Pomodoro Break Button: pomo_extendbreak_<channelId>
+      if (customId.startsWith('pomo_extendbreak_')) {
+        const targetChannelId = customId.split('_')[2];
+        const session = activeSessions.get(targetChannelId);
+        if (!session || session.phase !== 'break') {
+          return interaction.reply({
+            content: 'ℹ️ No active break is running for this session.',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+        const isParticipant = session.participants.has(member.id);
+        const isAdmin = member.permissions.has(PermissionFlagsBits.MoveMembers);
+        if (!isParticipant && !isAdmin) {
+          return interaction.reply({
+            content: '❌ Only session participants can extend the break!',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+
+        clearTimeout(session.timeoutId);
+        session.breakMinutes = (session.breakMinutes || 5) + 5;
+        const newEndTime = Math.max(Date.now(), session.endTime) + 5 * 60 * 1000;
+        session.endTime = newEndTime;
+        const remainingMs = newEndTime - Date.now();
+        const minsLeft = Math.max(1, Math.ceil(remainingMs / 60000));
+        const endSec = Math.floor(newEndTime / 1000);
+
+        session.timeoutId = setTimeout(() => {
+          resumePomodoroStudy(session.studyChannelId);
+        }, remainingMs);
+
+        const roomIdsToProcess = session.allRoomIds ? Array.from(session.allRoomIds) : [session.studyChannelId];
+        for (const rId of roomIdsToProcess) {
+          await setVoiceChannelStatus(
+            rId,
+            formatPomoBreakStatus(session.currentRound, session.totalRounds, minsLeft)
+          );
+        }
+
+        return interaction.reply({
+          content: `⏳ <@${member.id}> extended the break by **+5 minutes**! Break now ends <t:${endSec}:R> (at <t:${endSec}:t>).`,
+        });
       }
 
       // Skip to Pomodoro Break Early Button: pomo_skiptobreak_<channelId>
