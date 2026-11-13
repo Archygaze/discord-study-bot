@@ -1669,7 +1669,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             const pName = pMember ? (pMember.displayName || pMember.user.username) : 'Student';
 
             const desk = await guild.channels.create({
-              name: `📚 ${pName}'s Desk`,
+              name: `📖 ${pName}'s Desk`,
               type: ChannelType.GuildVoice,
               parent: category,
               userLimit: 1,
