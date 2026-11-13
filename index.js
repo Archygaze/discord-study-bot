@@ -103,6 +103,12 @@ const commands = [
             .setMinValue(1)
             .setMaxValue(24)
         )
+        .addBooleanOption((opt) =>
+          opt
+            .setName('separate_rooms')
+            .setDescription('Private solo rooms (focus alone, meet in Break Lounge)? Default: False')
+            .setRequired(false)
+        )
     ),
   new SlashCommandBuilder()
     .setName('unlock')
@@ -389,6 +395,7 @@ async function startFocusSession(
   }
 
   const isPomodoro = !!pomodoroOptions;
+  const isSeparateRooms = !!(pomodoroOptions && pomodoroOptions.isSeparateRooms);
   const currentRound = pomodoroOptions ? pomodoroOptions.currentRound || 1 : 1;
   const totalRounds = pomodoroOptions ? pomodoroOptions.totalRounds || 4 : 1;
   const studyMinutes = pomodoroOptions
@@ -400,110 +407,172 @@ async function startFocusSession(
   const displayMinutes = isPomodoro ? studyMinutes : Math.max(1, Math.ceil(actualDurationMs / 60000));
   const totalMinutes = originalMinutes || displayMinutes;
 
-  for (const m of membersInRoom) {
-    lockedUsers.set(m.id, studyChannel.id);
-    pausedSessions.delete(m.id);
-  }
-
-  // Lock Method A: Set userLimit to total participant count (including invited friends so they never see "Channel Full"!)
-  await studyChannel.setUserLimit(Math.max(1, participantIds.size)).catch(() => {});
-
-  // Lock Method B: Grant Connect + ViewChannel to every participant & invited friend BEFORE denying @everyone
-  try {
-    await studyChannel.permissionOverwrites.edit(client.user.id, {
-      ViewChannel: true,
-      Connect: true,
-      SendMessages: true,
-      ManageChannels: true,
-      MoveMembers: true,
-    });
-    for (const userId of participantIds) {
-      await studyChannel.permissionOverwrites.edit(userId, {
-        ViewChannel: true,
-        Connect: true,
-      });
-    }
-    await studyChannel.permissionOverwrites.edit(guild.roles.everyone, { Connect: false });
-  } catch {
-    // Even without Manage Roles, Method A (userLimit) + Method C (auto-bouncing outsiders) locks the room!
-  }
-
   const endTimeMs = Date.now() + actualDurationMs;
   const endTimestampSec = Math.floor(endTimeMs / 1000);
 
-  // Set the Voice Channel Status immediately
-  const initialStatus = isPomodoro
-    ? formatPomoStudyStatus(participantNames, currentRound, totalRounds, displayMinutes)
-    : formatStudyStatus(participantNames, displayMinutes);
-  await setVoiceChannelStatus(studyChannel.id, initialStatus);
+  const allRoomIds = isSeparateRooms && pomodoroOptions.allRoomIds
+    ? pomodoroOptions.allRoomIds
+    : new Set([studyChannel.id]);
+
+  if (isSeparateRooms && pomodoroOptions.userRooms) {
+    // Parallel Solo Study: lock each member into their own private 1-person cubicle
+    for (const [uid, rId] of pomodoroOptions.userRooms.entries()) {
+      lockedUsers.set(uid, rId);
+      pausedSessions.delete(uid);
+
+      const mem = await guild.members.fetch(uid).catch(() => null);
+      const name = mem ? (mem.displayName || mem.user.username) : 'Student';
+      await setVoiceChannelStatus(
+        rId,
+        formatPomoStudyStatus([name], currentRound, totalRounds, displayMinutes)
+      );
+
+      const cubicleCh = await guild.channels.fetch(rId).catch(() => null);
+      if (cubicleCh) {
+        const cubicleEmbed = new EmbedBuilder()
+          .setColor(0xed4245)
+          .setTitle(`🍅 Private Focus Cubicle — Round ${currentRound}/${totalRounds} (${displayMinutes}m)`)
+          .setDescription(
+            `Welcome <@${uid}>! This is your **private focus cubicle**.\n\n` +
+              `💬 **Status:** \`${formatPomoStudyStatus([name], currentRound, totalRounds, displayMinutes)}\`\n` +
+              `⏳ **Study Ends:** <t:${endTimestampSec}:R> (at <t:${endTimestampSec}:t>)\n` +
+              `☕ **Next Up:** ${breakMinutes}-minute group break in <#${breakChannel ? breakChannel.id : ''}>\n` +
+              `👥 **Study Group:** ${Array.from(participantIds).map((id) => `<@${id}>`).join(', ')}\n\n` +
+              `*Focus with zero voice distractions! When the timer ends, everyone will automatically meet in the Break Lounge!*`
+          );
+
+        const cubicleRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`pomo_skiptobreak_${studyChannel.id}`)
+            .setLabel('Skip to Break Early')
+            .setEmoji('☕')
+            .setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder()
+            .setCustomId(`focus_unlock_${studyChannel.id}`)
+            .setLabel('End Session & Unlock')
+            .setEmoji('🔓')
+            .setStyle(ButtonStyle.Danger)
+        );
+
+        await cubicleCh.send({ content: `<@${uid}>`, embeds: [cubicleEmbed], components: [cubicleRow] }).catch(() => {});
+      }
+    }
+  } else {
+    // Standard shared study room
+    for (const m of membersInRoom) {
+      lockedUsers.set(m.id, studyChannel.id);
+      pausedSessions.delete(m.id);
+    }
+
+    // Lock Method A: Set userLimit to total participant count (including invited friends so they never see "Channel Full"!)
+    await studyChannel.setUserLimit(Math.max(1, participantIds.size)).catch(() => {});
+
+    // Lock Method B: Grant Connect + ViewChannel to every participant & invited friend BEFORE denying @everyone
+    try {
+      await studyChannel.permissionOverwrites.edit(client.user.id, {
+        ViewChannel: true,
+        Connect: true,
+        SendMessages: true,
+        ManageChannels: true,
+        MoveMembers: true,
+      });
+      for (const userId of participantIds) {
+        await studyChannel.permissionOverwrites.edit(userId, {
+          ViewChannel: true,
+          Connect: true,
+        });
+      }
+      await studyChannel.permissionOverwrites.edit(guild.roles.everyone, { Connect: false });
+    } catch {
+      // Even without Manage Roles, Method A (userLimit) + Method C (auto-bouncing outsiders) locks the room!
+    }
+
+    // Set the Voice Channel Status immediately
+    const initialStatus = isPomodoro
+      ? formatPomoStudyStatus(participantNames, currentRound, totalRounds, displayMinutes)
+      : formatStudyStatus(participantNames, displayMinutes);
+    await setVoiceChannelStatus(studyChannel.id, initialStatus);
+
+    const embed = new EmbedBuilder()
+      .setColor(isResumed ? 0xfee75c : 0xed4245)
+      .setTitle(
+        isPomodoro
+          ? `🍅 Pomodoro Study — Round ${currentRound}/${totalRounds} (${displayMinutes}m)`
+          : isResumed
+            ? `🔄 Resumed Focus Session (${displayMinutes} mins left)`
+            : `🔒 Focus Session Locked (${displayMinutes} mins)`
+      )
+      .setDescription(
+        isPomodoro
+          ? `Started by <@${starterUser.id}> in <#${studyChannel.id}>\n\n` +
+              `💬 **Channel Status:** \`${formatPomoStudyStatus(participantNames, currentRound, totalRounds, displayMinutes)}\`\n` +
+              `⏳ **Study Ends:** <t:${endTimestampSec}:R> (at <t:${endTimestampSec}:t>)\n` +
+              `☕ **Next Up:** ${breakMinutes}-minute break in <#${breakChannel ? breakChannel.id : ''}>\n` +
+              `🔁 **Schedule:** ${totalRounds} rounds of ${studyMinutes}m study + ${breakMinutes}m break\n` +
+              `👥 **Locked-in:** ${Array.from(participantIds)
+                .map((id) => `<@${id}>`)
+                .join(', ')}\n\n` +
+              `*During study rounds, this room is locked to outsiders. When the timer hits zero, everyone moves to Break Lounge automatically!*`
+          : (isResumed
+              ? `Welcome back <@${starterUser.id}>! Continuing your previous **${totalMinutes}-minute** session in <#${studyChannel.id}>.\n\n`
+              : `Started by <@${starterUser.id}> in <#${studyChannel.id}>\n\n`) +
+              `💬 **Channel Status:** \`${formatStudyStatus(participantNames, displayMinutes)}\`\n` +
+              `⏳ **Ends:** <t:${endTimestampSec}:R> (at <t:${endTimestampSec}:t>)\n` +
+              `👥 **Locked-in:** ${Array.from(participantIds)
+                .map((id) => `<@${id}>`)
+                .join(', ')}\n\n` +
+              `*This room is locked to outsiders. If you log off early, your remaining time will be saved!*`
+      );
+
+    const row = new ActionRowBuilder();
+    if (isPomodoro) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`pomo_skiptobreak_${studyChannel.id}`)
+          .setLabel('Skip to Break Early')
+          .setEmoji('☕')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId(`focus_unlock_${studyChannel.id}`)
+          .setLabel('End Session & Unlock Early')
+          .setEmoji('🔓')
+          .setStyle(ButtonStyle.Danger)
+      );
+    } else {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`focus_unlock_${studyChannel.id}`)
+          .setLabel('End Session & Unlock Early')
+          .setEmoji('🔓')
+          .setStyle(ButtonStyle.Danger)
+      );
+    }
+
+    await studyChannel.send({ embeds: [embed], components: [row] }).catch(() => {});
+  }
 
   // Update the Voice Channel Status every minute as the timer counts down
   const intervalId = setInterval(async () => {
     const remainingMs = endTimeMs - Date.now();
     if (remainingMs <= 0) return;
     const minsLeft = Math.max(1, Math.ceil(remainingMs / 60000));
-    const status = isPomodoro
-      ? formatPomoStudyStatus(participantNames, currentRound, totalRounds, minsLeft)
-      : formatStudyStatus(participantNames, minsLeft);
-    await setVoiceChannelStatus(studyChannel.id, status);
+
+    if (isSeparateRooms && pomodoroOptions.userRooms) {
+      for (const [uid, rId] of pomodoroOptions.userRooms.entries()) {
+        const mem = guild.members.cache.get(uid);
+        const name = mem ? (mem.displayName || mem.user.username) : 'Student';
+        await setVoiceChannelStatus(
+          rId,
+          formatPomoStudyStatus([name], currentRound, totalRounds, minsLeft)
+        );
+      }
+    } else {
+      const status = isPomodoro
+        ? formatPomoStudyStatus(participantNames, currentRound, totalRounds, minsLeft)
+        : formatStudyStatus(participantNames, minsLeft);
+      await setVoiceChannelStatus(studyChannel.id, status);
+    }
   }, 60 * 1000);
-
-  const embed = new EmbedBuilder()
-    .setColor(isResumed ? 0xfee75c : 0xed4245)
-    .setTitle(
-      isPomodoro
-        ? `🍅 Pomodoro Study — Round ${currentRound}/${totalRounds} (${displayMinutes}m)`
-        : isResumed
-          ? `🔄 Resumed Focus Session (${displayMinutes} mins left)`
-          : `🔒 Focus Session Locked (${displayMinutes} mins)`
-    )
-    .setDescription(
-      isPomodoro
-        ? `Started by <@${starterUser.id}> in <#${studyChannel.id}>\n\n` +
-            `💬 **Channel Status:** \`${formatPomoStudyStatus(participantNames, currentRound, totalRounds, displayMinutes)}\`\n` +
-            `⏳ **Study Ends:** <t:${endTimestampSec}:R> (at <t:${endTimestampSec}:t>)\n` +
-            `☕ **Next Up:** ${breakMinutes}-minute break in <#${breakChannel ? breakChannel.id : ''}>\n` +
-            `🔁 **Schedule:** ${totalRounds} rounds of ${studyMinutes}m study + ${breakMinutes}m break\n` +
-            `👥 **Locked-in:** ${Array.from(participantIds)
-              .map((id) => `<@${id}>`)
-              .join(', ')}\n\n` +
-            `*During study rounds, this room is locked to outsiders. When the timer hits zero, everyone moves to Break Lounge automatically!*`
-        : (isResumed
-            ? `Welcome back <@${starterUser.id}>! Continuing your previous **${totalMinutes}-minute** session in <#${studyChannel.id}>.\n\n`
-            : `Started by <@${starterUser.id}> in <#${studyChannel.id}>\n\n`) +
-            `💬 **Channel Status:** \`${formatStudyStatus(participantNames, displayMinutes)}\`\n` +
-            `⏳ **Ends:** <t:${endTimestampSec}:R> (at <t:${endTimestampSec}:t>)\n` +
-            `👥 **Locked-in:** ${Array.from(participantIds)
-              .map((id) => `<@${id}>`)
-              .join(', ')}\n\n` +
-            `*This room is locked to outsiders. If you log off early, your remaining time will be saved!*`
-    );
-
-  const row = new ActionRowBuilder();
-  if (isPomodoro) {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`pomo_skiptobreak_${studyChannel.id}`)
-        .setLabel('Skip to Break Early')
-        .setEmoji('☕')
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(`focus_unlock_${studyChannel.id}`)
-        .setLabel('End Session & Unlock Early')
-        .setEmoji('🔓')
-        .setStyle(ButtonStyle.Danger)
-    );
-  } else {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`focus_unlock_${studyChannel.id}`)
-        .setLabel('End Session & Unlock Early')
-        .setEmoji('🔓')
-        .setStyle(ButtonStyle.Danger)
-    );
-  }
-
-  const msg = await studyChannel.send({ embeds: [embed], components: [row] });
 
   const timeoutId = setTimeout(() => {
     if (isPomodoro) {
@@ -513,7 +582,7 @@ async function startFocusSession(
     }
   }, actualDurationMs);
 
-  activeSessions.set(studyChannel.id, {
+  const sessionObj = {
     guildId: guild.id,
     studyChannelId: studyChannel.id,
     breakChannelId: breakChannel ? breakChannel.id : null,
@@ -522,7 +591,6 @@ async function startFocusSession(
     endTime: endTimeMs,
     timeoutId,
     intervalId,
-    messageId: msg.id,
     durationMinutes: totalMinutes,
     isPomodoro,
     phase: 'study',
@@ -530,9 +598,16 @@ async function startFocusSession(
     totalRounds,
     studyMinutes,
     breakMinutes,
-  });
+    isSeparateRooms,
+    userRooms: pomodoroOptions && pomodoroOptions.userRooms ? pomodoroOptions.userRooms : null,
+    allRoomIds,
+  };
 
-  return { ok: true, embed, row };
+  for (const rId of allRoomIds) {
+    activeSessions.set(rId, sessionObj);
+  }
+
+  return { ok: true };
 }
 
 // Transition a Pomodoro session from Study phase to Break phase in the Break Lounge
@@ -552,7 +627,6 @@ async function transitionToPomodoroBreak(studyChannelId) {
 
   try {
     const guild = await client.guilds.fetch(session.guildId);
-    const studyChannel = await guild.channels.fetch(session.studyChannelId).catch(() => null);
     const foundBreak = findBreakChannel(guild);
     const breakChannel = session.breakChannelId
       ? await guild.channels.fetch(session.breakChannelId).catch(() => foundBreak)
@@ -562,85 +636,87 @@ async function transitionToPomodoroBreak(studyChannelId) {
       .map((id) => `<@${id}>`)
       .join(' ');
 
-    if (studyChannel) {
-      // Prevent sweep or voice update from deleting the study room during the break
-      spawningRooms.add(studyChannel.id);
-      setTimeout(() => spawningRooms.delete(studyChannel.id), 5000);
+    const breakDurationMs = session.breakMinutes * 60 * 1000;
+    const breakEndMs = Date.now() + breakDurationMs;
+    const breakEndSec = Math.floor(breakEndMs / 1000);
+    session.endTime = breakEndMs;
 
-      // Move everyone currently in the Study Room to the Break Lounge
-      if (breakChannel) {
-        for (const [, member] of studyChannel.members) {
-          if (!member.user.bot) {
-            await member.voice
-              .setChannel(breakChannel, 'Pomodoro break time - moved to Break Lounge')
-              .catch((err) => {
-                console.error(`Failed to move ${member.user.tag} to Break Lounge:`, err.message);
-              });
+    const roomIdsToProcess = session.allRoomIds ? Array.from(session.allRoomIds) : [session.studyChannelId];
+
+    for (const rId of roomIdsToProcess) {
+      spawningRooms.add(rId);
+      setTimeout(() => spawningRooms.delete(rId), 5000);
+      const ch = await guild.channels.fetch(rId).catch(() => null);
+      if (ch) {
+        if (breakChannel) {
+          for (const [, member] of ch.members) {
+            if (!member.user.bot) {
+              await member.voice
+                .setChannel(breakChannel, 'Pomodoro break time - moved to Break Lounge')
+                .catch((err) => {
+                  console.error(`Failed to move ${member.user.tag} to Break Lounge:`, err.message);
+                });
+            }
           }
         }
-      }
-
-      const breakDurationMs = session.breakMinutes * 60 * 1000;
-      const breakEndMs = Date.now() + breakDurationMs;
-      const breakEndSec = Math.floor(breakEndMs / 1000);
-      session.endTime = breakEndMs;
-
-      // Update study channel status
-      await setVoiceChannelStatus(
-        studyChannel.id,
-        formatPomoBreakStatus(session.currentRound, session.totalRounds, session.breakMinutes)
-      );
-
-      const breakEmbed = new EmbedBuilder()
-        .setColor(0x57f287)
-        .setTitle(`☕ Break Time! — Round ${session.currentRound}/${session.totalRounds} Complete`)
-        .setDescription(
-          `Awesome job ${mentions}! You completed **Round ${session.currentRound} of ${session.totalRounds}** (${session.studyMinutes}m).\n\n` +
-            `Take **${session.breakMinutes} minutes** to relax, stretch, grab water, or chat in the Break Lounge!\n\n` +
-            `⏳ **Break Ends:** <t:${breakEndSec}:R> (at <t:${breakEndSec}:t>)\n` +
-            `🔜 **Next Up:** Round ${session.currentRound + 1 <= session.totalRounds ? `${session.currentRound + 1}/${session.totalRounds} (${session.studyMinutes}m study)` : 'Final Wrap-Up'}\n\n` +
-            `*You will automatically be moved back to <#${studyChannel.id}> when the break timer finishes!*`
-        );
-
-      const breakRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`pomo_skipbreak_${studyChannel.id}`)
-          .setLabel('Skip Break & Resume Study Now')
-          .setEmoji('▶️')
-          .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-          .setCustomId(`focus_unlock_${studyChannel.id}`)
-          .setLabel('End Session Early')
-          .setEmoji('🔓')
-          .setStyle(ButtonStyle.Danger)
-      );
-
-      if (breakChannel) {
-        await breakChannel
-          .send({ content: mentions, embeds: [breakEmbed], components: [breakRow] })
-          .catch(() => {});
-      } else {
-        await studyChannel
-          .send({ content: mentions, embeds: [breakEmbed], components: [breakRow] })
-          .catch(() => {});
-      }
-
-      // Interval to update voice status countdown every minute
-      session.intervalId = setInterval(async () => {
-        const remainingMs = breakEndMs - Date.now();
-        if (remainingMs <= 0) return;
-        const minsLeft = Math.max(1, Math.ceil(remainingMs / 60000));
         await setVoiceChannelStatus(
-          studyChannel.id,
+          rId,
+          formatPomoBreakStatus(session.currentRound, session.totalRounds, session.breakMinutes)
+        );
+      }
+    }
+
+    const breakEmbed = new EmbedBuilder()
+      .setColor(0x57f287)
+      .setTitle(
+        session.isSeparateRooms
+          ? `☕ Break Time! — Cubicles Meet in Break Lounge (${session.currentRound}/${session.totalRounds})`
+          : `☕ Break Time! — Round ${session.currentRound}/${session.totalRounds} Complete`
+      )
+      .setDescription(
+        `Awesome job ${mentions}! You completed **Round ${session.currentRound} of ${session.totalRounds}** (${session.studyMinutes}m)${session.isSeparateRooms ? ' in your private cubicles' : ''}.\n\n` +
+          `Take **${session.breakMinutes} minutes** to relax, stretch, grab water, or chat in the Break Lounge!\n\n` +
+          `⏳ **Break Ends:** <t:${breakEndSec}:R> (at <t:${breakEndSec}:t>)\n` +
+          `🔜 **Next Up:** Round ${session.currentRound + 1 <= session.totalRounds ? `${session.currentRound + 1}/${session.totalRounds} (${session.studyMinutes}m study)` : 'Final Wrap-Up'}\n\n` +
+          `*You will automatically be moved back to your ${session.isSeparateRooms ? 'private cubicles' : 'Study Room'} when the break timer finishes!*`
+      );
+
+    const breakRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`pomo_skipbreak_${session.studyChannelId}`)
+        .setLabel('Skip Break & Resume Study Now')
+        .setEmoji('▶️')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`focus_unlock_${session.studyChannelId}`)
+        .setLabel('End Session Early')
+        .setEmoji('🔓')
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    if (breakChannel) {
+      await breakChannel
+        .send({ content: mentions, embeds: [breakEmbed], components: [breakRow] })
+        .catch(() => {});
+    }
+
+    // Interval to update voice status countdown every minute
+    session.intervalId = setInterval(async () => {
+      const remainingMs = breakEndMs - Date.now();
+      if (remainingMs <= 0) return;
+      const minsLeft = Math.max(1, Math.ceil(remainingMs / 60000));
+      for (const rId of roomIdsToProcess) {
+        await setVoiceChannelStatus(
+          rId,
           formatPomoBreakStatus(session.currentRound, session.totalRounds, minsLeft)
         );
-      }, 60 * 1000);
+      }
+    }, 60 * 1000);
 
-      // Break timer finishes -> resume next study round
-      session.timeoutId = setTimeout(() => {
-        resumePomodoroStudy(studyChannel.id);
-      }, breakDurationMs);
-    }
+    // Break timer finishes -> resume next study round
+    session.timeoutId = setTimeout(() => {
+      resumePomodoroStudy(session.studyChannelId);
+    }, breakDurationMs);
   } catch (err) {
     console.error('Error during transitionToPomodoroBreak:', err);
   }
@@ -665,86 +741,150 @@ async function resumePomodoroStudy(studyChannelId) {
 
   try {
     const guild = await client.guilds.fetch(session.guildId);
-    const studyChannel = await guild.channels.fetch(session.studyChannelId).catch(() => null);
     const foundBreak = findBreakChannel(guild);
     const breakChannel = session.breakChannelId
       ? await guild.channels.fetch(session.breakChannelId).catch(() => foundBreak)
       : foundBreak;
-
-    if (!studyChannel) {
-      activeSessions.delete(studyChannelId);
-      return;
-    }
-
-    // Move all participants back into the Study Room from Break Lounge (or anywhere in voice in the guild)
-    for (const userId of session.participants) {
-      lockedUsers.set(userId, studyChannel.id);
-      const member = await guild.members.fetch(userId).catch(() => null);
-      if (member && member.voice && member.voice.channelId) {
-        await member.voice
-          .setChannel(studyChannel, `Pomodoro Round ${session.currentRound} starting - back to study!`)
-          .catch(() => {});
-      }
-    }
-
-    // Re-lock channel limit to participants
-    await studyChannel.setUserLimit(Math.max(1, session.participants.size)).catch(() => {});
 
     const studyDurationMs = session.studyMinutes * 60 * 1000;
     const endTimeMs = Date.now() + studyDurationMs;
     const endTimestampSec = Math.floor(endTimeMs / 1000);
     session.endTime = endTimeMs;
 
-    await setVoiceChannelStatus(
-      studyChannel.id,
-      formatPomoStudyStatus(session.participantNames, session.currentRound, session.totalRounds, session.studyMinutes)
-    );
+    if (session.isSeparateRooms && session.userRooms) {
+      // Parallel Solo Study: Return each user to their individual cubicle
+      const userRoomsEntries =
+        session.userRooms instanceof Map
+          ? Array.from(session.userRooms.entries())
+          : Object.entries(session.userRooms);
 
-    session.intervalId = setInterval(async () => {
-      const remainingMs = endTimeMs - Date.now();
-      if (remainingMs <= 0) return;
-      const minsLeft = Math.max(1, Math.ceil(remainingMs / 60000));
+      for (const [userId, roomId] of userRoomsEntries) {
+        lockedUsers.set(userId, roomId);
+        const member = await guild.members.fetch(userId).catch(() => null);
+        if (member && member.voice && member.voice.channelId) {
+          await member.voice
+            .setChannel(roomId, `Pomodoro Round ${session.currentRound} starting - back to your cubicle!`)
+            .catch(() => {});
+        }
+
+        const cubicle = await guild.channels.fetch(roomId).catch(() => null);
+        if (cubicle) {
+          await cubicle.setUserLimit(1).catch(() => {});
+          const userName = member ? (member.displayName || member.user.username) : 'Student';
+          await setVoiceChannelStatus(
+            roomId,
+            formatPomoStudyStatus([userName], session.currentRound, session.totalRounds, session.studyMinutes)
+          );
+
+          const roundEmbed = new EmbedBuilder()
+            .setColor(0xed4245)
+            .setTitle(`🍅 Pomodoro Round ${session.currentRound}/${session.totalRounds} — Private Cubicle (${session.studyMinutes}m)`)
+            .setDescription(
+              `🔔 **Break is over! Welcome back to your private cubicle, <@${userId}>!**\n\n` +
+                `💬 **Status:** \`${formatPomoStudyStatus([userName], session.currentRound, session.totalRounds, session.studyMinutes)}\`\n` +
+                `⏳ **Study Ends:** <t:${endTimestampSec}:R> (at <t:${endTimestampSec}:t>)\n` +
+                `☕ **Next Break:** ${session.breakMinutes} mins in ${breakChannel ? `<#${breakChannel.id}>` : 'Break Lounge'}\n\n` +
+                `*This cubicle is locked (1 person max). Stay focused!*`
+            );
+
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`pomo_skiptobreak_${roomId}`)
+              .setLabel('Skip to Break Early')
+              .setEmoji('☕')
+              .setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder()
+              .setCustomId(`focus_unlock_${roomId}`)
+              .setLabel('End Session & Unlock')
+              .setEmoji('🔓')
+              .setStyle(ButtonStyle.Danger)
+          );
+
+          await cubicle.send({ content: `<@${userId}>`, embeds: [roundEmbed], components: [row] }).catch(() => {});
+        }
+      }
+
+      // Interval to update voice status countdown for each cubicle
+      session.intervalId = setInterval(async () => {
+        const remainingMs = endTimeMs - Date.now();
+        if (remainingMs <= 0) return;
+        const minsLeft = Math.max(1, Math.ceil(remainingMs / 60000));
+        for (const [userId, roomId] of userRoomsEntries) {
+          const member = await guild.members.fetch(userId).catch(() => null);
+          const userName = member ? (member.displayName || member.user.username) : 'Student';
+          await setVoiceChannelStatus(
+            roomId,
+            formatPomoStudyStatus([userName], session.currentRound, session.totalRounds, minsLeft)
+          );
+        }
+      }, 60 * 1000);
+    } else {
+      const studyChannel = await guild.channels.fetch(session.studyChannelId).catch(() => null);
+      if (!studyChannel) return;
+
+      // Move all participants back into the Study Room from Break Lounge (or anywhere in voice in the guild)
+      for (const userId of session.participants) {
+        lockedUsers.set(userId, studyChannel.id);
+        const member = await guild.members.fetch(userId).catch(() => null);
+        if (member && member.voice && member.voice.channelId) {
+          await member.voice
+            .setChannel(studyChannel, `Pomodoro Round ${session.currentRound} starting - back to study!`)
+            .catch(() => {});
+        }
+      }
+
+      // Re-lock channel limit to participants
+      await studyChannel.setUserLimit(Math.max(1, session.participants.size)).catch(() => {});
+
       await setVoiceChannelStatus(
         studyChannel.id,
-        formatPomoStudyStatus(session.participantNames, session.currentRound, session.totalRounds, minsLeft)
-      );
-    }, 60 * 1000);
-
-    const mentions = Array.from(session.participants)
-      .map((id) => `<@${id}>`)
-      .join(' ');
-
-    const roundEmbed = new EmbedBuilder()
-      .setColor(0xed4245)
-      .setTitle(`🍅 Pomodoro Study — Round ${session.currentRound}/${session.totalRounds} (${session.studyMinutes} mins)`)
-      .setDescription(
-        `🔔 **Break is over! Time to get back into focus mode!**\n\n` +
-          `💬 **Channel Status:** \`${formatPomoStudyStatus(session.participantNames, session.currentRound, session.totalRounds, session.studyMinutes)}\`\n` +
-          `⏳ **Study Ends:** <t:${endTimestampSec}:R> (at <t:${endTimestampSec}:t>)\n` +
-          `☕ **Next Break:** ${session.breakMinutes} mins in <#${breakChannel ? breakChannel.id : ''}>\n` +
-          `👥 **Locked-in:** ${Array.from(session.participants)
-            .map((id) => `<@${id}>`)
-            .join(', ')}\n\n` +
-          `*This room is locked to outsiders. Stay focused!*`
+        formatPomoStudyStatus(session.participantNames, session.currentRound, session.totalRounds, session.studyMinutes)
       );
 
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`pomo_skiptobreak_${studyChannel.id}`)
-        .setLabel('Skip to Break Early')
-        .setEmoji('☕')
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(`focus_unlock_${studyChannel.id}`)
-        .setLabel('End Session & Unlock')
-        .setEmoji('🔓')
-        .setStyle(ButtonStyle.Danger)
-    );
+      session.intervalId = setInterval(async () => {
+        const remainingMs = endTimeMs - Date.now();
+        if (remainingMs <= 0) return;
+        const minsLeft = Math.max(1, Math.ceil(remainingMs / 60000));
+        await setVoiceChannelStatus(
+          studyChannel.id,
+          formatPomoStudyStatus(session.participantNames, session.currentRound, session.totalRounds, minsLeft)
+        );
+      }, 60 * 1000);
 
-    await studyChannel.send({ content: mentions, embeds: [roundEmbed], components: [row] }).catch(() => {});
+      const mentions = Array.from(session.participants)
+        .map((id) => `<@${id}>`)
+        .join(' ');
+
+      const roundEmbed = new EmbedBuilder()
+        .setColor(0xed4245)
+        .setTitle(`🍅 Pomodoro Study — Round ${session.currentRound}/${session.totalRounds} (${session.studyMinutes} mins)`)
+        .setDescription(
+          `🔔 **Break is over! Time to get back into focus mode!**\n\n` +
+            `💬 **Channel Status:** \`${formatPomoStudyStatus(session.participantNames, session.currentRound, session.totalRounds, session.studyMinutes)}\`\n` +
+            `⏳ **Study Ends:** <t:${endTimestampSec}:R> (at <t:${endTimestampSec}:t>)\n` +
+            `☕ **Next Break:** ${session.breakMinutes} mins in ${breakChannel ? `<#${breakChannel.id}>` : 'Break Lounge'}\n` +
+            `👥 **Locked-in:** ${mentions}\n\n` +
+            `*This room is locked to outsiders. Stay focused!*`
+        );
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`pomo_skiptobreak_${studyChannel.id}`)
+          .setLabel('Skip to Break Early')
+          .setEmoji('☕')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId(`focus_unlock_${studyChannel.id}`)
+          .setLabel('End Session & Unlock')
+          .setEmoji('🔓')
+          .setStyle(ButtonStyle.Danger)
+      );
+
+      await studyChannel.send({ content: mentions, embeds: [roundEmbed], components: [row] }).catch(() => {});
+    }
 
     session.timeoutId = setTimeout(() => {
-      transitionToPomodoroBreak(studyChannel.id);
+      transitionToPomodoroBreak(studyChannelId);
     }, studyDurationMs);
   } catch (err) {
     console.error('Error during resumePomodoroStudy:', err);
@@ -758,8 +898,12 @@ async function endPomodoroSessionComplete(studyChannelId) {
 
   clearTimeout(session.timeoutId);
   clearInterval(session.intervalId);
-  activeSessions.delete(studyChannelId);
-  roomInvitedFriends.delete(studyChannelId);
+
+  const roomIds = session.allRoomIds ? Array.from(session.allRoomIds) : [session.studyChannelId];
+  for (const rId of roomIds) {
+    activeSessions.delete(rId);
+    roomInvitedFriends.delete(rId);
+  }
 
   for (const userId of session.participants) {
     lockedUsers.delete(userId);
@@ -768,7 +912,6 @@ async function endPomodoroSessionComplete(studyChannelId) {
 
   try {
     const guild = await client.guilds.fetch(session.guildId);
-    const studyChannel = await guild.channels.fetch(session.studyChannelId).catch(() => null);
     const foundBreak = findBreakChannel(guild);
     const breakChannel = session.breakChannelId
       ? await guild.channels.fetch(session.breakChannelId).catch(() => foundBreak)
@@ -779,43 +922,48 @@ async function endPomodoroSessionComplete(studyChannelId) {
       .join(' ');
     const totalMinutesStudied = session.totalRounds * session.studyMinutes;
 
-    if (studyChannel) {
-      spawningRooms.add(studyChannel.id);
+    const finalEmbed = new EmbedBuilder()
+      .setColor(0x57f287)
+      .setTitle('🏆 Pomodoro Marathon Complete!')
+      .setDescription(
+        `🎉 Amazing work ${mentions}!\n\n` +
+          `You completed all **${session.totalRounds} rounds** (${totalMinutesStudied} total minutes of focused study)${session.isSeparateRooms ? ' in your private cubicles' : ''}!\n\n` +
+          `Moved everyone to **${breakChannel ? breakChannel.name : 'Break Lounge'}** for a well-deserved rest!`
+      );
 
-      const finalEmbed = new EmbedBuilder()
-        .setColor(0x57f287)
-        .setTitle('🏆 Pomodoro Marathon Complete!')
-        .setDescription(
-          `🎉 Amazing work ${mentions}!\n\n` +
-            `You completed all **${session.totalRounds} rounds** (${totalMinutesStudied} total minutes of focused study) in **${studyChannel.name}**!\n\n` +
-            `Moved everyone to **${breakChannel ? breakChannel.name : 'Break Lounge'}** for a well-deserved rest!`
-        );
-
-      if (breakChannel) {
-        for (const [, member] of studyChannel.members) {
-          if (!member.user.bot) {
-            await member.voice
-              .setChannel(breakChannel, 'Pomodoro complete - moved to Break Lounge')
-              .catch((err) => {
-                console.error(`Failed to move ${member.user.tag} to Break Lounge:`, err.message);
-              });
+    for (const rId of roomIds) {
+      spawningRooms.add(rId);
+      const room = await guild.channels.fetch(rId).catch(() => null);
+      if (room) {
+        if (breakChannel) {
+          for (const [, member] of room.members) {
+            if (!member.user.bot) {
+              await member.voice
+                .setChannel(breakChannel, 'Pomodoro complete - moved to Break Lounge')
+                .catch((err) => {
+                  console.error(`Failed to move ${member.user.tag} to Break Lounge:`, err.message);
+                });
+            }
           }
         }
-        await breakChannel.send({ content: mentions, embeds: [finalEmbed] }).catch(() => {});
-      } else {
-        await studyChannel.send({ content: mentions, embeds: [finalEmbed] }).catch(() => {});
+        if (isDynamicRoom(room)) {
+          setTimeout(async () => {
+            spawningRooms.delete(room.id);
+            const refreshed = await guild.channels.fetch(room.id).catch(() => null);
+            if (refreshed && refreshed.members.filter((m) => !m.user.bot).size === 0) {
+              dynamicStudyRooms.delete(room.id);
+              await refreshed.delete('Pomodoro finished and room is empty').catch(() => {});
+            }
+          }, 4000);
+        } else {
+          spawningRooms.delete(room.id);
+          await setVoiceChannelStatus(room.id, '');
+        }
       }
+    }
 
-      if (isDynamicRoom(studyChannel)) {
-        setTimeout(async () => {
-          spawningRooms.delete(studyChannel.id);
-          const refreshed = await guild.channels.fetch(studyChannel.id).catch(() => null);
-          if (refreshed && refreshed.members.filter((m) => !m.user.bot).size === 0) {
-            dynamicStudyRooms.delete(studyChannel.id);
-            await refreshed.delete('Pomodoro finished and room is empty').catch(() => {});
-          }
-        }, 4000);
-      }
+    if (breakChannel) {
+      await breakChannel.send({ content: mentions, embeds: [finalEmbed] }).catch(() => {});
     }
   } catch (err) {
     console.error('Error in endPomodoroSessionComplete:', err);
@@ -829,8 +977,12 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
 
   clearTimeout(session.timeoutId);
   clearInterval(session.intervalId);
-  activeSessions.delete(studyChannelId);
-  roomInvitedFriends.delete(studyChannelId);
+
+  const roomIds = session.allRoomIds ? Array.from(session.allRoomIds) : [session.studyChannelId];
+  for (const rId of roomIds) {
+    activeSessions.delete(rId);
+    roomInvitedFriends.delete(rId);
+  }
 
   for (const userId of session.participants) {
     lockedUsers.delete(userId);
@@ -839,7 +991,6 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
 
   try {
     const guild = await client.guilds.fetch(session.guildId);
-    const studyChannel = await guild.channels.fetch(session.studyChannelId).catch(() => null);
     const foundBreak = findBreakChannel(guild);
     const breakChannel = session.breakChannelId
       ? await guild.channels.fetch(session.breakChannelId).catch(() => foundBreak)
@@ -849,57 +1000,59 @@ async function endFocusSession(studyChannelId, endedEarly = false, endedByUser =
       .map((id) => `<@${id}>`)
       .join(' ');
 
-    if (studyChannel) {
-      // Prevent VoiceStateUpdate or sweep from deleting the channel mid-voice-transfer!
-      spawningRooms.add(studyChannel.id);
+    const resultEmbed = new EmbedBuilder()
+      .setColor(endedEarly ? 0xfee75c : 0x57f287)
+      .setTitle(endedEarly ? '🔓 Focus Session Ended' : '🎉 Focus Session Complete!')
+      .setDescription(
+        endedEarly
+          ? `Session ended early${endedByUser ? ` by <@${endedByUser.id}>` : ''}${session.isPomodoro ? ` (after Round ${session.currentRound}/${session.totalRounds})` : ''}. Moved everyone to **${breakChannel ? breakChannel.name : 'Break Lounge'}**!`
+          : `Great job ${mentions}! You completed **${session.durationMinutes} minutes** of focused study${session.isSeparateRooms ? ' in your private cubicles' : ''}. Enjoy your break!`
+      );
 
-      const resultEmbed = new EmbedBuilder()
-        .setColor(endedEarly ? 0xfee75c : 0x57f287)
-        .setTitle(endedEarly ? '🔓 Focus Session Ended' : '🎉 Focus Session Complete!')
-        .setDescription(
-          endedEarly
-            ? `Session ended early${endedByUser ? ` by <@${endedByUser.id}>` : ''}${session.isPomodoro ? ` (after Round ${session.currentRound}/${session.totalRounds})` : ''}. Moved everyone to **${breakChannel ? breakChannel.name : 'Break Lounge'}**!`
-            : `Great job ${mentions}! You completed **${session.durationMinutes} minutes** of focused study in **${studyChannel.name}**. Enjoy your break!`
-        );
-
-      if (breakChannel) {
-        // 1. Move everyone currently in the Study Room to the Break Lounge FIRST
-        for (const [, member] of studyChannel.members) {
-          if (!member.user.bot) {
-            await member.voice
-              .setChannel(breakChannel, 'Focus session ended - moving to Break Lounge')
-              .catch((err) => {
-                console.error(`Failed to move ${member.user.tag} to Break Lounge:`, err.message);
-              });
+    if (breakChannel) {
+      // 1. Move everyone currently in any of the Study Rooms to the Break Lounge FIRST
+      for (const rId of roomIds) {
+        const room = await guild.channels.fetch(rId).catch(() => null);
+        if (room) {
+          for (const [, member] of room.members) {
+            if (!member.user.bot) {
+              await member.voice
+                .setChannel(breakChannel, 'Focus session ended - moving to Break Lounge')
+                .catch((err) => {
+                  console.error(`Failed to move ${member.user.tag} to Break Lounge:`, err.message);
+                });
+            }
           }
         }
-
-        // 2. Send completion message in Break Lounge
-        await breakChannel
-          .send({ content: endedEarly ? undefined : mentions, embeds: [resultEmbed] })
-          .catch(() => {});
-      } else {
-        await studyChannel
-          .send({ content: endedEarly ? undefined : mentions, embeds: [resultEmbed] })
-          .catch(() => {});
       }
 
-      // 3. Wait 4 full seconds so Discord finishes transferring the voice connection to Break Lounge before deleting the study room!
-      if (isDynamicRoom(studyChannel)) {
-        setTimeout(async () => {
-          spawningRooms.delete(studyChannel.id);
-          const refreshed = await guild.channels.fetch(studyChannel.id).catch(() => null);
-          if (refreshed && refreshed.members.filter((m) => !m.user.bot).size === 0) {
-            dynamicStudyRooms.delete(studyChannel.id);
-            await refreshed.delete('Study session ended and room is empty').catch(() => {});
-          }
-        }, 4000);
-      } else {
-        spawningRooms.delete(studyChannel.id);
-        await setVoiceChannelStatus(studyChannel.id, '');
-        await studyChannel.permissionOverwrites
-          .edit(guild.roles.everyone, { Connect: null })
-          .catch(() => {});
+      // 2. Send completion message in Break Lounge
+      await breakChannel
+        .send({ content: endedEarly ? undefined : mentions, embeds: [resultEmbed] })
+        .catch(() => {});
+    }
+
+    // 3. Delete or reset all dynamic rooms
+    for (const rId of roomIds) {
+      spawningRooms.add(rId);
+      const room = await guild.channels.fetch(rId).catch(() => null);
+      if (room) {
+        if (isDynamicRoom(room)) {
+          setTimeout(async () => {
+            spawningRooms.delete(room.id);
+            const refreshed = await guild.channels.fetch(room.id).catch(() => null);
+            if (refreshed && refreshed.members.filter((m) => !m.user.bot).size === 0) {
+              dynamicStudyRooms.delete(room.id);
+              await refreshed.delete('Study session ended and room is empty').catch(() => {});
+            }
+          }, 4000);
+        } else {
+          spawningRooms.delete(room.id);
+          await setVoiceChannelStatus(room.id, '');
+          await room.permissionOverwrites
+            .edit(guild.roles.everyone, { Connect: null })
+            .catch(() => {});
+        }
       }
     }
   } catch (err) {
@@ -1184,6 +1337,27 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
         if (session && session.phase === 'break') {
           return; // Do NOT delete room or cancel session while resting in Break Lounge!
         }
+
+        if (session && session.isSeparateRooms) {
+          // Check if any other cubicles still have active human members
+          let anyOtherHumans = false;
+          if (session.allRoomIds) {
+            for (const rId of session.allRoomIds) {
+              if (rId === leftChannel.id) continue;
+              const rCh = guild.channels.cache.get(rId);
+              if (rCh && rCh.members.filter((m) => !m.user.bot).size > 0) {
+                anyOtherHumans = true;
+                break;
+              }
+            }
+          }
+          if (anyOtherHumans) {
+            // Other friends are still studying in their cubicles!
+            lockedUsers.delete(member.id);
+            return;
+          }
+        }
+
         const remainingMs = session.endTime - Date.now();
         if (remainingMs > 15000) {
           for (const userId of session.participants) {
@@ -1239,6 +1413,23 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
         .catch(() => {});
       return;
     }
+
+    if (session.isSeparateRooms && session.userRooms) {
+      const assignedRoomId =
+        session.userRooms instanceof Map
+          ? session.userRooms.get(member.id)
+          : session.userRooms[member.id];
+      if (assignedRoomId && assignedRoomId !== joinedChannel.id) {
+        const correctRoom = guild.channels.cache.get(assignedRoomId);
+        if (correctRoom) {
+          await member.voice
+            .setChannel(correctRoom, 'Redirected to your assigned private cubicle')
+            .catch(() => {});
+          return;
+        }
+      }
+    }
+
     lockedUsers.set(member.id, joinedChannel.id);
     const displayName = member.displayName || member.user.username;
     if (!session.participantNames.includes(displayName)) {
@@ -1415,8 +1606,143 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const friendsRaw = interaction.options.getString('friends') || '';
         const mentionedIds = Array.from(friendsRaw.matchAll(/<@!?(\d+)>/g), (m) => m[1]);
         const uniqueFriendIds = [...new Set(mentionedIds)].filter((id) => id !== member.id);
+        const separateRoomsOpt = interaction.options.getBoolean('separate_rooms') || false;
 
         await interaction.deferReply();
+
+        // Option A: Parallel Solo Study (Study Cubicles) — Everyone gets a private 1-person room and meets in Break Lounge!
+        if (!isSolo && separateRoomsOpt) {
+          const allParticipantIds = [member.id, ...uniqueFriendIds];
+          const userRooms = new Map();
+          const allRoomIds = [];
+          const category = (findStudyCategory(guild) && findStudyCategory(guild).id) || null;
+
+          const movedMembers = [];
+          const offlineMembers = [];
+
+          for (const pId of allParticipantIds) {
+            const pMember = await guild.members.fetch(pId).catch(() => null);
+            const pName = pMember ? (pMember.displayName || pMember.user.username) : 'Student';
+
+            const cubicle = await guild.channels.create({
+              name: `📖 ${pName}'s Cubicle`,
+              type: ChannelType.GuildVoice,
+              parent: category,
+              userLimit: 1,
+            });
+
+            dynamicStudyRooms.add(cubicle.id);
+            spawningRooms.add(cubicle.id);
+            setTimeout(() => spawningRooms.delete(cubicle.id), 20000);
+
+            // Restrict permissions so only this user and bot can connect
+            await cubicle.permissionOverwrites
+              .set([
+                {
+                  id: client.user.id,
+                  allow: [
+                    PermissionFlagsBits.ViewChannel,
+                    PermissionFlagsBits.Connect,
+                    PermissionFlagsBits.SendMessages,
+                    PermissionFlagsBits.ManageChannels,
+                    PermissionFlagsBits.MoveMembers,
+                  ],
+                },
+                {
+                  id: pId,
+                  allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect],
+                },
+                {
+                  id: guild.roles.everyone.id,
+                  deny: [PermissionFlagsBits.Connect],
+                },
+              ])
+              .catch(() => {});
+
+            userRooms.set(pId, cubicle.id);
+            allRoomIds.push(cubicle.id);
+            roomInvitedFriends.set(cubicle.id, new Set([pId]));
+
+            // Move to cubicle if in voice
+            if (pMember && pMember.voice && pMember.voice.channelId) {
+              await pMember.voice
+                .setChannel(cubicle, 'Moved to private cubicle for /study together')
+                .catch(() => {});
+              movedMembers.push(`<@${pId}>`);
+            } else {
+              offlineMembers.push(`<@${pId}>`);
+            }
+          }
+
+          pomodoroOptions.isSeparateRooms = true;
+          pomodoroOptions.userRooms = userRooms;
+          pomodoroOptions.allRoomIds = allRoomIds;
+
+          const callerCubicleId = userRooms.get(member.id);
+          const callerCubicle = await guild.channels.fetch(callerCubicleId);
+
+          // Build room links summary
+          const roomLinks = allParticipantIds
+            .map((pId) => {
+              const rId = userRooms.get(pId);
+              return `• <@${pId}>: <#${rId}>`;
+            })
+            .join('\n');
+
+          // If caller is in voice, start session immediately!
+          if (member.voice.channelId) {
+            const res = await startFocusSession(
+              guild,
+              callerCubicle,
+              breakChannel,
+              minutes * 60 * 1000,
+              interaction.user,
+              false,
+              minutes,
+              uniqueFriendIds,
+              pomodoroOptions
+            );
+
+            if (!res.ok) {
+              return interaction.editReply(`❌ ${res.error}`);
+            }
+
+            return interaction.editReply({
+              content:
+                `🚪 **Parallel Solo Study started!**\n\n` +
+                `🍅 **Pomodoro:** Round 1/${pomodoroOptions.totalRounds} (${pomodoroOptions.studyMinutes}m study / ${pomodoroOptions.breakMinutes}m break)\n` +
+                `🔒 **Private Cubicles created:**\n${roomLinks}\n\n` +
+                `☕ When the timer ends, everyone will automatically be moved to **${breakChannel ? breakChannel.name : 'Break Lounge'}** to chill together!`,
+            });
+          } else {
+            // Caller not in voice yet -> set pending timer on callerCubicle
+            pendingRoomTimers.set(callerCubicle.id, {
+              userId: member.id,
+              durationMs: minutes * 60 * 1000,
+              originalMinutes: minutes,
+              isResumed: false,
+              invitedFriendIds: uniqueFriendIds,
+              pomodoroOptions,
+            });
+
+            const joinRow = new ActionRowBuilder().addComponents(
+              new ButtonBuilder()
+                .setLabel(`Join Your Cubicle (${pomodoroOptions.studyMinutes}m Pomodoro)`)
+                .setEmoji('🔊')
+                .setStyle(ButtonStyle.Link)
+                .setURL(`https://discord.com/channels/${guild.id}/${callerCubicle.id}`)
+            );
+
+            return interaction.editReply({
+              content:
+                `✨ **Created your private cubicles for Parallel Solo Study!**\n\n` +
+                `🍅 **Pomodoro:** ${pomodoroOptions.studyMinutes}m study / ${pomodoroOptions.breakMinutes}m break × ${pomodoroOptions.totalRounds} rounds\n` +
+                `🔒 **Assigned Cubicles:**\n${roomLinks}\n\n` +
+                `Click **🔊 Join Your Cubicle** below to connect and start your focus timer:`,
+              components: [joinRow],
+            });
+          }
+        }
 
         let targetRoom = member.voice.channel;
         const paused = pausedSessions.get(member.id);
